@@ -18,9 +18,21 @@ args = "loan-decision-contract"
 name = "loan-decision-contract"
 author = "agent"
 
+[workflows.workflow.metadata]
+outputType = "webview"
+
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "python main.py"
+waitForPort = 5000
 
-[workflows.workflow.metadata]
-outputType = "console"
+[deployment]
+deploymentTarget = "autoscale"
+run = ["python", "main.py"]
+
+[nix]
+channel = "stable-25_05"
+
+[[ports]]
+localPort = 5000
+externalPort = 80
