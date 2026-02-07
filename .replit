@@ -34,5 +34,9 @@ run = ["gunicorn", "--bind=0.0.0.0:5000", "--reuse-port", "main:APP"]
 channel = "stable-25_05"
 
 [[ports]]
+localPort = 3000
+externalPort = 3000
+
+[[ports]]
 localPort = 5000
 externalPort = 80

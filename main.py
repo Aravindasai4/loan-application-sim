@@ -6,7 +6,6 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple
-from datetime import datetime, timezone
 
 from flask import Flask, request, redirect, url_for, render_template_string, abort
 
@@ -38,7 +37,7 @@ def init_db() -> None:
                 loan_amount REAL NOT NULL,
                 credit_score INTEGER NOT NULL,
                 employment_years REAL NOT NULL,
-                raw_json TEXT NOT NULL
+                raw_json TEXT NOT NULL,
                 source TEXT NOT NULL DEFAULT 'manual',
                 sim_day TEXT
             );
@@ -49,7 +48,7 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 engine_version TEXT NOT NULL,
                 risk_score REAL NOT NULL,
-                decision TEXT NOT NULL, -- APPROVE/REVIEW/REJECT
+                decision TEXT NOT NULL,
                 FOREIGN KEY(application_id) REFERENCES applications(id)
             );
 
@@ -57,8 +56,8 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 decision_id INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
-                reasons_json TEXT NOT NULL, -- list[str]
-                reason_details_json TEXT NOT NULL, -- list[{"code":..,"text":..,"value":..}]
+                reasons_json TEXT NOT NULL,
+                reason_details_json TEXT NOT NULL,
                 FOREIGN KEY(decision_id) REFERENCES decisions(id)
             );
 
@@ -66,22 +65,20 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 decision_id INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
-                status TEXT NOT NULL, -- PENDING/RESOLVED
+                status TEXT NOT NULL,
                 resolved_at TEXT,
-                human_outcome TEXT, -- APPROVE/REJECT
+                human_outcome TEXT,
                 human_notes TEXT,
                 FOREIGN KEY(decision_id) REFERENCES decisions(id)
             );
-            """
-            conn.execute("""
-            CREATE TABLE IF NOT EXISTS simulation_runs (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              sim_day TEXT NOT NULL UNIQUE,
-              created_at TEXT NOT NULL,
-              num_created INTEGER NOT NULL
-            )
-            """)
 
+            CREATE TABLE IF NOT EXISTS simulation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sim_day TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                num_created INTEGER NOT NULL
+            );
+            """
         )
 def migrate_db() -> None:
   with db() as conn:
@@ -507,7 +504,6 @@ def apply_get():
 
 @APP.post("/apply")
 def apply_post():
-    # Parse and validate inputs
     name = (request.form.get("applicant_name") or "").strip()
     try:
         annual_income = float(request.form["annual_income"])
@@ -525,58 +521,7 @@ def apply_post():
         employment_years=employment_years,
     )
 
-    risk_score, reason_details = compute_risk_and_reasons(inp)
-    decision, risk_score, reasons = create_application_and_decide(inp, source="manual")
-
-
-    # Write to DB
-    created_at = utc_now_iso()
-    raw = {
-        "applicant_name": inp.applicant_name,
-        "annual_income": inp.annual_income,
-        "loan_amount": inp.loan_amount,
-        "credit_score": inp.credit_score,
-        "employment_years": inp.employment_years,
-    }
-
-    with db() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO applications
-              (created_at, applicant_name, annual_income, loan_amount, credit_score, employment_years, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (created_at, inp.applicant_name, inp.annual_income, inp.loan_amount, inp.credit_score, inp.employment_years, json.dumps(raw)),
-        )
-        app_id = cur.lastrowid
-
-        cur = conn.execute(
-            """
-            INSERT INTO decisions (application_id, created_at, engine_version, risk_score, decision)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (app_id, created_at, ENGINE_VERSION, float(round(risk_score, 4)), decision),
-        )
-        decision_id = cur.lastrowid
-
-        reasons_json = json.dumps([d["code"] for d in reason_details])
-        reason_details_json = json.dumps(reason_details)
-        conn.execute(
-            """
-            INSERT INTO explanations (decision_id, created_at, reasons_json, reason_details_json)
-            VALUES (?, ?, ?, ?)
-            """,
-            (decision_id, created_at, reasons_json, reason_details_json),
-        )
-
-        if needs_review:
-            conn.execute(
-                """
-                INSERT INTO review_tasks (decision_id, created_at, status)
-                VALUES (?, ?, 'PENDING')
-                """,
-                (decision_id, created_at),
-            )
+    decision, risk_score, reason_details = create_application_and_decide(inp, source="manual")
 
     return render_template_string(
         RESULT_HTML,
@@ -707,5 +652,6 @@ def recent():
 if __name__ == "__main__":
     init_db()
     migrate_db()
-    APP.run(host="0.0.0.0", port=3000, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    APP.run(host="0.0.0.0", port=port)
 
