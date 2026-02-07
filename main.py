@@ -6,6 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple
+from datetime import datetime, timezone
 
 from flask import Flask, request, redirect, url_for, render_template_string, abort
 
@@ -38,6 +39,8 @@ def init_db() -> None:
                 credit_score INTEGER NOT NULL,
                 employment_years REAL NOT NULL,
                 raw_json TEXT NOT NULL
+                source TEXT NOT NULL DEFAULT 'manual',
+                sim_day TEXT
             );
 
             CREATE TABLE IF NOT EXISTS decisions (
@@ -70,7 +73,32 @@ def init_db() -> None:
                 FOREIGN KEY(decision_id) REFERENCES decisions(id)
             );
             """
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS simulation_runs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              sim_day TEXT NOT NULL UNIQUE,
+              created_at TEXT NOT NULL,
+              num_created INTEGER NOT NULL
+            )
+            """)
+
         )
+def migrate_db() -> None:
+  with db() as conn:
+      cols = {row["name"] for row in conn.execute("PRAGMA table_info(applications)").fetchall()}
+      if "source" not in cols:
+          conn.execute("ALTER TABLE applications ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+      if "sim_day" not in cols:
+          conn.execute("ALTER TABLE applications ADD COLUMN sim_day TEXT")
+
+      conn.execute("""
+      CREATE TABLE IF NOT EXISTS simulation_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sim_day TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        num_created INTEGER NOT NULL
+      )
+      """)
 
 
 def utc_now_iso() -> str:
@@ -198,7 +226,11 @@ APPLY_HTML = """
 
   <h1>Loan Application (Simulator)</h1>
   <p class="hint">This is a simulator. It logs decisions + explanations and routes edge cases to human review.</p>
-
+  
+  <form method="POST" action="/simulate/today" style="margin: 12px 0;">
+    <button type="submit">Simulate Today (3 apps)</button>
+  </form>
+  
   <form method="POST" action="/apply">
     <label>Applicant Name (optional)</label>
     <input name="applicant_name" placeholder="e.g., Aru"/>
@@ -406,6 +438,63 @@ RECENT_HTML = """
 # -----------------------------
 # Routes
 # -----------------------------
+
+
+def create_application_and_decide(inp: AppInput, source: str = "manual", sim_day: str | None = None):
+  risk_score, reason_details = compute_risk_and_reasons(inp)
+  decision, needs_review = decide(risk_score, inp)
+
+  created_at = utc_now_iso()
+  raw = {
+      "applicant_name": inp.applicant_name,
+      "annual_income": inp.annual_income,
+      "loan_amount": inp.loan_amount,
+      "credit_score": inp.credit_score,
+      "employment_years": inp.employment_years,
+      "source": source,
+      "sim_day": sim_day,
+  }
+
+  with db() as conn:
+      cur = conn.execute(
+          """
+          INSERT INTO applications
+            (created_at, applicant_name, annual_income, loan_amount, credit_score,
+             employment_years, raw_json, source, sim_day)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          """,
+          (created_at, inp.applicant_name, inp.annual_income, inp.loan_amount,
+           inp.credit_score, inp.employment_years, json.dumps(raw), source, sim_day),
+      )
+      app_id = cur.lastrowid
+
+      cur = conn.execute(
+          """
+          INSERT INTO decisions (application_id, created_at, engine_version, risk_score, decision)
+          VALUES (?, ?, ?, ?, ?)
+          """,
+          (app_id, created_at, ENGINE_VERSION, float(round(risk_score, 4)), decision),
+      )
+      decision_id = cur.lastrowid
+
+      conn.execute(
+          """
+          INSERT INTO explanations (decision_id, created_at, reasons_json, reason_details_json)
+          VALUES (?, ?, ?, ?)
+          """,
+          (decision_id, created_at,
+           json.dumps([d["code"] for d in reason_details]),
+           json.dumps(reason_details)),
+      )
+
+      if needs_review:
+          conn.execute(
+              "INSERT INTO review_tasks (decision_id, created_at, status) VALUES (?, ?, 'PENDING')",
+              (decision_id, created_at),
+          )
+
+  return decision, risk_score, reason_details
+
 @APP.get("/")
 def root():
     return redirect(url_for("apply_get"))
@@ -437,7 +526,8 @@ def apply_post():
     )
 
     risk_score, reason_details = compute_risk_and_reasons(inp)
-    decision, needs_review = decide(risk_score, inp)
+    decision, risk_score, reasons = create_application_and_decide(inp, source="manual")
+
 
     # Write to DB
     created_at = utc_now_iso()
@@ -496,6 +586,39 @@ def apply_post():
         engine_version=ENGINE_VERSION,
     )
 
+@APP.post("/simulate/today")
+def simulate_today():
+    import random
+    sim_day = datetime.now(timezone.utc).date().isoformat()
+
+    with db() as conn:
+        if conn.execute("SELECT 1 FROM simulation_runs WHERE sim_day = ?", (sim_day,)).fetchone():
+            return redirect(url_for("recent"))
+
+    rng = random.Random(sim_day)
+
+    samples = [
+        AppInput(f"sim-{sim_day}-A", rng.randint(80000, 140000),
+                 rng.randint(5000, 20000), rng.randint(720, 810),
+                 round(rng.uniform(3, 10), 1)),
+        AppInput(f"sim-{sim_day}-B", rng.randint(40000, 80000),
+                 rng.randint(15000, 40000), rng.randint(560, 680),
+                 round(rng.uniform(0.5, 3.5), 1)),
+        AppInput(f"sim-{sim_day}-C", rng.randint(25000, 60000),
+                 rng.randint(30000, 90000), rng.randint(420, 590),
+                 round(rng.uniform(0, 2.0), 1)),
+    ]
+
+    for s in samples:
+        create_application_and_decide(s, source="simulated", sim_day=sim_day)
+
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO simulation_runs (sim_day, created_at, num_created) VALUES (?, ?, 3)",
+            (sim_day, utc_now_iso()),
+        )
+
+    return redirect(url_for("recent"))
 
 @APP.get("/review")
 def review_queue():
@@ -583,5 +706,6 @@ def recent():
 
 if __name__ == "__main__":
     init_db()
-    port = int(os.environ.get("PORT", 5000))
-    APP.run(host="0.0.0.0", port=port)
+    migrate_db()
+    APP.run(host="0.0.0.0", port=3000, debug=True)
+
