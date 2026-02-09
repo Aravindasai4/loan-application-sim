@@ -132,6 +132,14 @@ def migrate_db() -> None:
             )
             """)
 
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_applicant_name "
+                "ON applications(applicant_name) WHERE applicant_name IS NOT NULL AND source = 'simulated'"
+            )
+        except Exception:
+            pass
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -605,6 +613,7 @@ def apply_post():
 @APP.post("/simulate/today")
 def simulate_today():
     import random
+    from uuid import uuid4
     sim_day = datetime.now(timezone.utc).date().isoformat()
 
     with db() as conn:
@@ -614,7 +623,12 @@ def simulate_today():
         ).fetchone()
         run_id = (row["max_run"] if row else 0) + 1
 
-    seed = f"{sim_day}-R{run_id}"
+        conn.execute(
+            "INSERT INTO simulation_runs (sim_day, run_id, created_at, num_created) VALUES (?, ?, ?, 3)",
+            (sim_day, run_id, utc_now_iso()),
+        )
+
+    seed = f"{sim_day}-R{run_id}-{uuid4()}"
     rng = random.Random(seed)
 
     prefix = f"sim-{sim_day}-R{run_id}"
@@ -632,12 +646,6 @@ def simulate_today():
 
     for s in samples:
         create_application_and_decide(s, source="simulated", sim_day=sim_day)
-
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO simulation_runs (sim_day, run_id, created_at, num_created) VALUES (?, ?, ?, 3)",
-            (sim_day, run_id, utc_now_iso()),
-        )
 
     return redirect(url_for("recent"))
 
