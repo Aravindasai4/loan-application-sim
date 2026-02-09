@@ -75,9 +75,11 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS simulation_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sim_day TEXT NOT NULL UNIQUE,
+                sim_day TEXT NOT NULL,
+                run_id INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
-                num_created INTEGER NOT NULL
+                num_created INTEGER NOT NULL,
+                UNIQUE(sim_day, run_id)
             );
             """
         )
@@ -91,14 +93,44 @@ def migrate_db() -> None:
         if "sim_day" not in cols:
             conn.execute("ALTER TABLE applications ADD COLUMN sim_day TEXT")
 
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS simulation_runs (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          sim_day TEXT NOT NULL UNIQUE,
-          created_at TEXT NOT NULL,
-          num_created INTEGER NOT NULL
-        )
-        """)
+        sr_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='simulation_runs'"
+        ).fetchone()
+
+        needs_rebuild = False
+        if sr_exists:
+            schema_sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='simulation_runs'"
+            ).fetchone()[0]
+            if "UNIQUE(sim_day, run_id)" not in schema_sql.replace(" ", ""):
+                needs_rebuild = True
+        
+        if needs_rebuild:
+            conn.executescript("""
+                ALTER TABLE simulation_runs RENAME TO simulation_runs_old;
+                CREATE TABLE simulation_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sim_day TEXT NOT NULL,
+                    run_id INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    num_created INTEGER NOT NULL,
+                    UNIQUE(sim_day, run_id)
+                );
+                INSERT INTO simulation_runs (sim_day, run_id, created_at, num_created)
+                    SELECT sim_day, COALESCE(run_id, 1), created_at, num_created FROM simulation_runs_old;
+                DROP TABLE simulation_runs_old;
+            """)
+        elif not sr_exists:
+            conn.execute("""
+            CREATE TABLE simulation_runs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              sim_day TEXT NOT NULL,
+              run_id INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              num_created INTEGER NOT NULL,
+              UNIQUE(sim_day, run_id)
+            )
+            """)
 
 
 def utc_now_iso() -> str:
@@ -576,19 +608,24 @@ def simulate_today():
     sim_day = datetime.now(timezone.utc).date().isoformat()
 
     with db() as conn:
-        if conn.execute("SELECT 1 FROM simulation_runs WHERE sim_day = ?", (sim_day,)).fetchone():
-            return redirect(url_for("recent"))
+        row = conn.execute(
+            "SELECT COALESCE(MAX(run_id), 0) AS max_run FROM simulation_runs WHERE sim_day = ?",
+            (sim_day,),
+        ).fetchone()
+        run_id = (row["max_run"] if row else 0) + 1
 
-    rng = random.Random(sim_day)
+    seed = f"{sim_day}-R{run_id}"
+    rng = random.Random(seed)
 
+    prefix = f"sim-{sim_day}-R{run_id}"
     samples = [
-        AppInput(f"sim-{sim_day}-A", rng.randint(80000, 140000),
+        AppInput(f"{prefix}-A", rng.randint(80000, 140000),
                  rng.randint(5000, 20000), rng.randint(720, 810),
                  round(rng.uniform(3, 10), 1)),
-        AppInput(f"sim-{sim_day}-B", rng.randint(40000, 80000),
+        AppInput(f"{prefix}-B", rng.randint(40000, 80000),
                  rng.randint(15000, 40000), rng.randint(560, 680),
                  round(rng.uniform(0.5, 3.5), 1)),
-        AppInput(f"sim-{sim_day}-C", rng.randint(25000, 60000),
+        AppInput(f"{prefix}-C", rng.randint(25000, 60000),
                  rng.randint(30000, 90000), rng.randint(420, 590),
                  round(rng.uniform(0, 2.0), 1)),
     ]
@@ -598,8 +635,8 @@ def simulate_today():
 
     with db() as conn:
         conn.execute(
-            "INSERT INTO simulation_runs (sim_day, created_at, num_created) VALUES (?, ?, 3)",
-            (sim_day, utc_now_iso()),
+            "INSERT INTO simulation_runs (sim_day, run_id, created_at, num_created) VALUES (?, ?, ?, 3)",
+            (sim_day, run_id, utc_now_iso()),
         )
 
     return redirect(url_for("recent"))
@@ -803,8 +840,9 @@ def dbinfo():
     })
 
 
+init_db()
+migrate_db()
+
 if __name__ == "__main__":
-    init_db()
-    migrate_db()
     port = int(os.environ.get("PORT", 5000))
     APP.run(host="0.0.0.0", port=port)

@@ -25,7 +25,7 @@ When a reviewer approves/rejects a REVIEW case, the decisions table is updated w
 - `GET /` - Redirects to /apply
 - `GET /apply` - Loan application form
 - `POST /apply` - Submit application
-- `POST /simulate/today` - Generate 3 simulated applications
+- `POST /simulate/today` - Generate 3 simulated applications per run (supports multiple runs per day)
 - `GET /review` - Human review queue
 - `POST /review/<id>/resolve` - Approve/reject a review task
 - `GET /recent` - Recent decisions list
@@ -48,3 +48,4 @@ Autoscale deployment using gunicorn: `gunicorn --bind=0.0.0.0:5000 --reuse-port 
 
 ## Recent Changes
 - Feb 2026: Fixed persistent DB path, human override logic, decision detail page, added /dbinfo
+- Feb 2026: Updated simulation_runs to support multiple runs per day with (sim_day, run_id) uniqueness. Naming pattern: sim-YYYY-MM-DD-R{run_id}-A/B/C. RNG seeded with "{sim_day}-R{run_id}" for unique results per run.
