@@ -451,7 +451,7 @@ DECISION_HTML = """
     <li>Loan amount: {{loan_amount}}</li>
     <li>Credit score: {{credit_score}}</li>
     <li>Employment years: {{employment_years}}</li>
-    <li>Source: {{source}}</li>
+    <li>Source: {{app_source}}</li>
     <li>Sim day: {{sim_day or "\u2014"}}</li>
   </ul>
 
@@ -779,7 +779,7 @@ def decision_page(lookup_id: int):
         loan_amount=row["loan_amount"],
         credit_score=row["credit_score"],
         employment_years=row["employment_years"],
-        source=row["source"],
+        app_source=row["source"],
         sim_day=row["sim_day"],
         reasons=reasons,
         reason_details_json=raw_json,
