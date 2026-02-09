@@ -27,7 +27,7 @@ args = "python main.py"
 waitForPort = 5000
 
 [deployment]
-deploymentTarget = "gce"
+deploymentTarget = "autoscale"
 run = ["gunicorn", "--bind=0.0.0.0:5000", "--reuse-port", "main:APP"]
 
 [nix]

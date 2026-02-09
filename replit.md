@@ -1,34 +1,50 @@
 # Loan Decision Contract
 
 ## Overview
-A Flask web application that evaluates loan applications based on various criteria including income, credit score, loan amount, and employment history.
+A Flask web application that simulates loan application decisions using a rules-based risk engine, with human review override support and persistent SQLite storage.
 
 ## Project Structure
-- `main.py` - Flask web server with loan evaluation logic and UI
+- `main.py` - Single-file Flask app: DB setup, decision engine, routes, templates
+- `loan_sim.db` - SQLite database (auto-created, persistent across restarts)
 
 ## How It Works
-The application uses a scoring system to evaluate loan applications:
-- **Income Ratio**: Compares loan amount to annual income
-- **Credit Score**: Evaluates creditworthiness (300-850 scale)
-- **Employment History**: Considers years of stable employment
+The application uses a weighted risk scoring system:
+- **Credit Score** (55% weight): Lower score => higher risk
+- **Debt-to-Income** (30% weight): Higher loan/income ratio => higher risk
+- **Employment History** (15% weight): Shorter tenure => higher risk
 
 ### Decision Outcomes
-- **APPROVED**: Score >= 70
-- **CONDITIONAL APPROVAL**: Score 50-69
-- **DENIED**: Score < 50
+- **APPROVE**: Risk score < 0.45
+- **REVIEW**: Risk score 0.45-0.55 or edge cases (sent to human review queue)
+- **REJECT**: Risk score > 0.55
 
-### API Endpoints
-- `GET /` - Web interface for loan evaluation
-- `POST /evaluate` - JSON API for loan evaluation
+### Human Override
+When a reviewer approves/rejects a REVIEW case, the decisions table is updated with the human outcome and engine_version set to "human-override-v1".
 
-## Running the Application
+### Routes
+- `GET /` - Redirects to /apply
+- `GET /apply` - Loan application form
+- `POST /apply` - Submit application
+- `POST /simulate/today` - Generate 3 simulated applications
+- `GET /review` - Human review queue
+- `POST /review/<id>/resolve` - Approve/reject a review task
+- `GET /recent` - Recent decisions list
+- `GET /decision/<id>` - Decision detail page (accepts decision_id or application_id)
+- `GET /dbinfo` - Debug info (JSON)
+
+## Database
+- Uses absolute path: `BASE_DIR/loan_sim.db`
+- Single persistent DB file across all routes and restarts
+- Tables: applications, decisions, explanations, review_tasks, simulation_runs
+
+## Running
 ```bash
 python main.py
 ```
-The server runs on port 5000.
+Server runs on port 5000 (or PORT env var).
 
 ## Deployment
-Configured for Replit autoscale deployment with `python main.py` as the run command.
+Autoscale deployment using gunicorn: `gunicorn --bind=0.0.0.0:5000 --reuse-port main:APP`
 
 ## Recent Changes
-- February 2026: Converted to Flask web application for deployment support
+- Feb 2026: Fixed persistent DB path, human override logic, decision detail page, added /dbinfo

@@ -7,10 +7,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple
 
-from flask import Flask, request, redirect, url_for, render_template_string, abort
+from flask import Flask, request, redirect, url_for, render_template_string, abort, jsonify
 
 APP = Flask(__name__)
-DB_PATH = os.environ.get("DB_PATH", "loan_sim.db")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "loan_sim.db")
 ENGINE_VERSION = "rules-v0.1"
 
 
@@ -80,22 +81,24 @@ def init_db() -> None:
             );
             """
         )
-def migrate_db() -> None:
-  with db() as conn:
-      cols = {row["name"] for row in conn.execute("PRAGMA table_info(applications)").fetchall()}
-      if "source" not in cols:
-          conn.execute("ALTER TABLE applications ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
-      if "sim_day" not in cols:
-          conn.execute("ALTER TABLE applications ADD COLUMN sim_day TEXT")
 
-      conn.execute("""
-      CREATE TABLE IF NOT EXISTS simulation_runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sim_day TEXT NOT NULL UNIQUE,
-        created_at TEXT NOT NULL,
-        num_created INTEGER NOT NULL
-      )
-      """)
+
+def migrate_db() -> None:
+    with db() as conn:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(applications)").fetchall()}
+        if "source" not in cols:
+            conn.execute("ALTER TABLE applications ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+        if "sim_day" not in cols:
+            conn.execute("ALTER TABLE applications ADD COLUMN sim_day TEXT")
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS simulation_runs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          sim_day TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL,
+          num_created INTEGER NOT NULL
+        )
+        """)
 
 
 def utc_now_iso() -> str:
@@ -119,25 +122,10 @@ def clamp(x: float, lo: float, hi: float) -> float:
 
 
 def compute_risk_and_reasons(inp: AppInput) -> Tuple[float, List[Dict]]:
-    """
-    Returns:
-      risk_score in [0,1] where higher = riskier (more likely to default)
-      reason_details: list of dicts with code/text/value/impact
-    """
-    # Derived features
-    dti = inp.loan_amount / max(inp.annual_income, 1.0)  # debt-to-income proxy (rough)
-
-    # Normalize signals into 0..1 risk contributions
-    # Credit score: lower score => higher risk
-    credit_risk = clamp((720 - inp.credit_score) / 320.0, 0.0, 1.0)  # ~400-720 range
-
-    # DTI: higher => higher risk
-    dti_risk = clamp((dti - 0.15) / 0.85, 0.0, 1.0)  # 0.15 safe-ish, >1.0 very risky
-
-    # Employment: shorter => higher risk
-    emp_risk = clamp((2.0 - inp.employment_years) / 2.0, 0.0, 1.0)  # <2y risky
-
-    # Weighted risk score
+    dti = inp.loan_amount / max(inp.annual_income, 1.0)
+    credit_risk = clamp((720 - inp.credit_score) / 320.0, 0.0, 1.0)
+    dti_risk = clamp((dti - 0.15) / 0.85, 0.0, 1.0)
+    emp_risk = clamp((2.0 - inp.employment_years) / 2.0, 0.0, 1.0)
     risk_score = clamp(0.55 * credit_risk + 0.30 * dti_risk + 0.15 * emp_risk, 0.0, 1.0)
 
     details = [
@@ -161,24 +149,17 @@ def compute_risk_and_reasons(inp: AppInput) -> Tuple[float, List[Dict]]:
         },
     ]
 
-    # Sort by impact and keep top 3
     details.sort(key=lambda d: d["impact"], reverse=True)
     return risk_score, details[:3]
 
 
 def decide(risk_score: float, inp: AppInput) -> Tuple[str, bool]:
-    """
-    Returns: (decision, needs_review)
-    """
-    # Policy thresholds (tweak later)
     approve_th = 0.45
     review_th = 0.55
 
-    # Edge-case gating: near-threshold => review
     near_band = 0.03
     near_threshold = (abs(risk_score - approve_th) <= near_band) or (abs(risk_score - review_th) <= near_band)
 
-    # Additional hard flags to force review
     forced_review = False
     if inp.credit_score < 520:
         forced_review = True
@@ -421,7 +402,7 @@ RECENT_HTML = """
           <td>{{r["created_at"]}}</td>
           <td>
             <a href="/decision/{{r['decision_id']}}">
-              {{r["applicant_name"] or "—"}}
+              {{r["applicant_name"] or "\u2014"}}
             </a>
           </td>
           <td><b>{{r["decision"]}}</b></td>
@@ -458,7 +439,7 @@ DECISION_HTML = """
   <h1>Decision</h1>
 
   <p>
-    Applicant: <b>{{applicant_name or "—"}}</b>
+    Applicant: <b>{{applicant_name or "\u2014"}}</b>
     <span class="pill">{{decision}}</span>
     <span class="pill">risk={{risk_score}}</span>
     <span class="pill">{{engine_version}}</span>
@@ -471,7 +452,7 @@ DECISION_HTML = """
     <li>Credit score: {{credit_score}}</li>
     <li>Employment years: {{employment_years}}</li>
     <li>Source: {{source}}</li>
-    <li>Sim day: {{sim_day or "—"}}</li>
+    <li>Sim day: {{sim_day or "\u2014"}}</li>
   </ul>
 
   <h2>Top reasons</h2>
@@ -487,57 +468,6 @@ DECISION_HTML = """
 </html>
 """
 
-@APP.get("/decision/<int:decision_id>")
-def decision_page(decision_id: int):
-    with db() as conn:
-        row = conn.execute("""
-            SELECT
-              d.id as decision_id,
-              d.created_at,
-              d.engine_version,
-              d.risk_score,
-              d.decision,
-              a.applicant_name,
-              a.annual_income,
-              a.loan_amount,
-              a.credit_score,
-              a.employment_years,
-              a.source,
-              a.sim_day,
-              e.reason_details_json
-            FROM decisions d
-            JOIN applications a ON a.id = d.application_id
-            LEFT JOIN explanations e ON e.decision_id = d.id
-            WHERE d.id = ?
-        """, (decision_id,)).fetchone()
-
-    if not row:
-        return ("Not found", 404)
-
-    reasons = []
-    reason_details_json = row["reason_details_json"] or "[]"
-    try:
-        reasons = json.loads(reason_details_json)
-    except Exception:
-        reasons = []
-
-    return render_template_string(
-        DECISION_HTML,
-        decision_id=decision_id,
-        applicant_name=row["applicant_name"],
-        decision=row["decision"],
-        risk_score=row["risk_score"],
-        engine_version=row["engine_version"],
-        annual_income=row["annual_income"],
-        loan_amount=row["loan_amount"],
-        credit_score=row["credit_score"],
-        employment_years=row["employment_years"],
-        source=row["source"],
-        sim_day=row["sim_day"],
-        reasons=reasons,
-        reason_details_json=reason_details_json,
-    )
-
 
 # -----------------------------
 # Routes
@@ -545,59 +475,60 @@ def decision_page(decision_id: int):
 
 
 def create_application_and_decide(inp: AppInput, source: str = "manual", sim_day: str | None = None):
-  risk_score, reason_details = compute_risk_and_reasons(inp)
-  decision, needs_review = decide(risk_score, inp)
+    risk_score, reason_details = compute_risk_and_reasons(inp)
+    decision, needs_review = decide(risk_score, inp)
 
-  created_at = utc_now_iso()
-  raw = {
-      "applicant_name": inp.applicant_name,
-      "annual_income": inp.annual_income,
-      "loan_amount": inp.loan_amount,
-      "credit_score": inp.credit_score,
-      "employment_years": inp.employment_years,
-      "source": source,
-      "sim_day": sim_day,
-  }
+    created_at = utc_now_iso()
+    raw = {
+        "applicant_name": inp.applicant_name,
+        "annual_income": inp.annual_income,
+        "loan_amount": inp.loan_amount,
+        "credit_score": inp.credit_score,
+        "employment_years": inp.employment_years,
+        "source": source,
+        "sim_day": sim_day,
+    }
 
-  with db() as conn:
-      cur = conn.execute(
-          """
-          INSERT INTO applications
-            (created_at, applicant_name, annual_income, loan_amount, credit_score,
-             employment_years, raw_json, source, sim_day)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-          """,
-          (created_at, inp.applicant_name, inp.annual_income, inp.loan_amount,
-           inp.credit_score, inp.employment_years, json.dumps(raw), source, sim_day),
-      )
-      app_id = cur.lastrowid
+    with db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO applications
+              (created_at, applicant_name, annual_income, loan_amount, credit_score,
+               employment_years, raw_json, source, sim_day)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (created_at, inp.applicant_name, inp.annual_income, inp.loan_amount,
+             inp.credit_score, inp.employment_years, json.dumps(raw), source, sim_day),
+        )
+        app_id = cur.lastrowid
 
-      cur = conn.execute(
-          """
-          INSERT INTO decisions (application_id, created_at, engine_version, risk_score, decision)
-          VALUES (?, ?, ?, ?, ?)
-          """,
-          (app_id, created_at, ENGINE_VERSION, float(round(risk_score, 4)), decision),
-      )
-      decision_id = cur.lastrowid
+        cur = conn.execute(
+            """
+            INSERT INTO decisions (application_id, created_at, engine_version, risk_score, decision)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (app_id, created_at, ENGINE_VERSION, float(round(risk_score, 4)), decision),
+        )
+        decision_id = cur.lastrowid
 
-      conn.execute(
-          """
-          INSERT INTO explanations (decision_id, created_at, reasons_json, reason_details_json)
-          VALUES (?, ?, ?, ?)
-          """,
-          (decision_id, created_at,
-           json.dumps([d["code"] for d in reason_details]),
-           json.dumps(reason_details)),
-      )
+        conn.execute(
+            """
+            INSERT INTO explanations (decision_id, created_at, reasons_json, reason_details_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (decision_id, created_at,
+             json.dumps([d["code"] for d in reason_details]),
+             json.dumps(reason_details)),
+        )
 
-      if needs_review:
-          conn.execute(
-              "INSERT INTO review_tasks (decision_id, created_at, status) VALUES (?, ?, 'PENDING')",
-              (decision_id, created_at),
-          )
+        if needs_review:
+            conn.execute(
+                "INSERT INTO review_tasks (decision_id, created_at, status) VALUES (?, ?, 'PENDING')",
+                (decision_id, created_at),
+            )
 
-  return decision, risk_score, reason_details
+    return decision, risk_score, reason_details
+
 
 @APP.get("/")
 def root():
@@ -638,6 +569,7 @@ def apply_post():
         engine_version=ENGINE_VERSION,
     )
 
+
 @APP.post("/simulate/today")
 def simulate_today():
     import random
@@ -672,6 +604,7 @@ def simulate_today():
 
     return redirect(url_for("recent"))
 
+
 @APP.get("/review")
 def review_queue():
     with db() as conn:
@@ -687,7 +620,7 @@ def review_queue():
             FROM review_tasks rt
             JOIN decisions d ON d.id = rt.decision_id
             JOIN applications a ON a.id = d.application_id
-            JOIN explanations e ON e.decision_id = d.id
+            LEFT JOIN explanations e ON e.decision_id = d.id
             WHERE rt.status = 'PENDING'
             ORDER BY rt.created_at DESC
             """
@@ -695,7 +628,10 @@ def review_queue():
 
     tasks = []
     for r in rows:
-        reasons = json.loads(r["reason_details_json"])
+        try:
+            reasons = json.loads(r["reason_details_json"] or "[]")
+        except Exception:
+            reasons = []
         tasks.append(
             {
                 "task_id": r["task_id"],
@@ -723,11 +659,15 @@ def resolve_task(task_id: int):
         abort(400, "Outcome must be APPROVE or REJECT.")
 
     with db() as conn:
-        row = conn.execute("SELECT id, status FROM review_tasks WHERE id = ?", (task_id,)).fetchone()
+        row = conn.execute(
+            "SELECT id, status, decision_id FROM review_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
         if not row:
             abort(404, "Task not found.")
         if row["status"] != "PENDING":
             abort(400, "Task already resolved.")
+
+        now = utc_now_iso()
 
         conn.execute(
             """
@@ -735,7 +675,16 @@ def resolve_task(task_id: int):
             SET status='RESOLVED', resolved_at=?, human_outcome=?, human_notes=?
             WHERE id=?
             """,
-            (utc_now_iso(), outcome, notes, task_id),
+            (now, outcome, notes, task_id),
+        )
+
+        conn.execute(
+            """
+            UPDATE decisions
+            SET decision=?, engine_version='human-override-v1'
+            WHERE id=?
+            """,
+            (outcome, row["decision_id"]),
         )
 
     return redirect(url_for("review_queue"))
@@ -756,9 +705,106 @@ def recent():
     return render_template_string(RECENT_HTML, rows=rows)
 
 
+@APP.get("/decision/<int:lookup_id>")
+def decision_page(lookup_id: int):
+    with db() as conn:
+        row = conn.execute("""
+            SELECT
+              d.id as decision_id,
+              d.created_at,
+              d.engine_version,
+              d.risk_score,
+              d.decision,
+              a.applicant_name,
+              a.annual_income,
+              a.loan_amount,
+              a.credit_score,
+              a.employment_years,
+              a.source,
+              a.sim_day,
+              e.reason_details_json
+            FROM decisions d
+            JOIN applications a ON a.id = d.application_id
+            LEFT JOIN explanations e ON e.decision_id = d.id
+            WHERE d.id = ?
+            ORDER BY d.created_at DESC
+            LIMIT 1
+        """, (lookup_id,)).fetchone()
+
+        if not row:
+            row = conn.execute("""
+                SELECT
+                  d.id as decision_id,
+                  d.created_at,
+                  d.engine_version,
+                  d.risk_score,
+                  d.decision,
+                  a.applicant_name,
+                  a.annual_income,
+                  a.loan_amount,
+                  a.credit_score,
+                  a.employment_years,
+                  a.source,
+                  a.sim_day,
+                  e.reason_details_json
+                FROM decisions d
+                JOIN applications a ON a.id = d.application_id
+                LEFT JOIN explanations e ON e.decision_id = d.id
+                WHERE d.application_id = ?
+                ORDER BY d.created_at DESC
+                LIMIT 1
+            """, (lookup_id,)).fetchone()
+
+    if not row:
+        return ("Decision not found", 404)
+
+    reasons = []
+    raw_json = ""
+    try:
+        raw_json = row["reason_details_json"] or "[]"
+        reasons = json.loads(raw_json)
+        if not isinstance(reasons, list):
+            reasons = []
+    except Exception:
+        reasons = []
+
+    return render_template_string(
+        DECISION_HTML,
+        decision_id=row["decision_id"],
+        applicant_name=row["applicant_name"],
+        decision=row["decision"],
+        risk_score=row["risk_score"],
+        engine_version=row["engine_version"],
+        annual_income=row["annual_income"],
+        loan_amount=row["loan_amount"],
+        credit_score=row["credit_score"],
+        employment_years=row["employment_years"],
+        source=row["source"],
+        sim_day=row["sim_day"],
+        reasons=reasons,
+        reason_details_json=raw_json,
+    )
+
+
+@APP.get("/dbinfo")
+def dbinfo():
+    with db() as conn:
+        app_count = conn.execute("SELECT COUNT(*) as c FROM applications").fetchone()["c"]
+        dec_count = conn.execute("SELECT COUNT(*) as c FROM decisions").fetchone()["c"]
+        rev_count = conn.execute("SELECT COUNT(*) as c FROM review_tasks").fetchone()["c"]
+
+    return jsonify({
+        "db_path": os.path.abspath(DB_PATH),
+        "cwd": os.getcwd(),
+        "pid": os.getpid(),
+        "applications_count": app_count,
+        "decisions_count": dec_count,
+        "review_tasks_count": rev_count,
+    })
+
+
 if __name__ == "__main__":
     init_db()
     migrate_db()
     port = int(os.environ.get("PORT", 5000))
     APP.run(host="0.0.0.0", port=port)
-
