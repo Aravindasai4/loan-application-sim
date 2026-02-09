@@ -419,7 +419,11 @@ RECENT_HTML = """
       {% for r in rows %}
         <tr>
           <td>{{r["created_at"]}}</td>
-          <td>{{r["applicant_name"] or ""}}</td>
+          <td>
+            <a href="/decision/{{r['decision_id']}}">
+              {{r["applicant_name"] or "—"}}
+            </a>
+          </td>
           <td><b>{{r["decision"]}}</b></td>
           <td><code>{{r["risk_score"]}}</code></td>
           <td><code>{{r["engine_version"]}}</code></td>
@@ -430,6 +434,109 @@ RECENT_HTML = """
 </body>
 </html>
 """
+
+DECISION_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Decision {{decision_id}}</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 900px; margin: 32px auto; padding: 0 16px; }
+    .nav a { margin-right: 12px; }
+    .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; background:#eee; margin-left: 8px;}
+    pre { background:#f6f6f6; padding:12px; border-radius:10px; overflow:auto; }
+  </style>
+</head>
+<body>
+  <div class="nav">
+    <a href="/apply">Apply</a>
+    <a href="/review">Review Queue</a>
+    <a href="/recent">Recent Decisions</a>
+  </div>
+
+  <h1>Decision</h1>
+
+  <p>
+    Applicant: <b>{{applicant_name or "—"}}</b>
+    <span class="pill">{{decision}}</span>
+    <span class="pill">risk={{risk_score}}</span>
+    <span class="pill">{{engine_version}}</span>
+  </p>
+
+  <h2>Inputs</h2>
+  <ul>
+    <li>Annual income: {{annual_income}}</li>
+    <li>Loan amount: {{loan_amount}}</li>
+    <li>Credit score: {{credit_score}}</li>
+    <li>Employment years: {{employment_years}}</li>
+    <li>Source: {{source}}</li>
+    <li>Sim day: {{sim_day or "—"}}</li>
+  </ul>
+
+  <h2>Top reasons</h2>
+  <ul>
+  {% for r in reasons %}
+    <li><b>{{r.code}}</b>: {{r.text}} (value={{r.value}}, impact={{r.impact}})</li>
+  {% endfor %}
+  </ul>
+
+  <h3>Raw explanation JSON</h3>
+  <pre>{{reason_details_json}}</pre>
+</body>
+</html>
+"""
+
+@APP.get("/decision/<int:decision_id>")
+def decision_page(decision_id: int):
+    with db() as conn:
+        row = conn.execute("""
+            SELECT
+              d.id as decision_id,
+              d.created_at,
+              d.engine_version,
+              d.risk_score,
+              d.decision,
+              a.applicant_name,
+              a.annual_income,
+              a.loan_amount,
+              a.credit_score,
+              a.employment_years,
+              a.source,
+              a.sim_day,
+              e.reason_details_json
+            FROM decisions d
+            JOIN applications a ON a.id = d.application_id
+            LEFT JOIN explanations e ON e.decision_id = d.id
+            WHERE d.id = ?
+        """, (decision_id,)).fetchone()
+
+    if not row:
+        return ("Not found", 404)
+
+    reasons = []
+    reason_details_json = row["reason_details_json"] or "[]"
+    try:
+        reasons = json.loads(reason_details_json)
+    except Exception:
+        reasons = []
+
+    return render_template_string(
+        DECISION_HTML,
+        decision_id=decision_id,
+        applicant_name=row["applicant_name"],
+        decision=row["decision"],
+        risk_score=row["risk_score"],
+        engine_version=row["engine_version"],
+        annual_income=row["annual_income"],
+        loan_amount=row["loan_amount"],
+        credit_score=row["credit_score"],
+        employment_years=row["employment_years"],
+        source=row["source"],
+        sim_day=row["sim_day"],
+        reasons=reasons,
+        reason_details_json=reason_details_json,
+    )
 
 
 # -----------------------------
@@ -639,11 +746,11 @@ def recent():
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT d.created_at, a.applicant_name, d.decision, d.risk_score, d.engine_version
+            SELECT d.id AS decision_id, d.created_at, a.applicant_name, d.decision, d.risk_score, d.engine_version
             FROM decisions d
             JOIN applications a ON a.id = d.application_id
             ORDER BY d.created_at DESC
-            LIMIT 50
+            LIMIT 500
             """
         ).fetchall()
     return render_template_string(RECENT_HTML, rows=rows)
