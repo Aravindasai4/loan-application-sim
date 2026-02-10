@@ -310,6 +310,7 @@ APPLY_HTML = """
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
+    <a href="/sim">Simulation</a>
   </div>
 
   <h1>Loan Application (Simulator)</h1>
@@ -374,6 +375,7 @@ RESULT_HTML = """
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
+    <a href="/sim">Simulation</a>
   </div>
 
   <h1>Decision</h1>
@@ -421,6 +423,7 @@ REVIEW_HTML = """
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
+    <a href="/sim">Simulation</a>
   </div>
 
   <h1>Human Review Queue</h1>
@@ -500,6 +503,7 @@ RECENT_HTML = """
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
+    <a href="/sim">Simulation</a>
   </div>
 
   <h1>Recent Decisions</h1>
@@ -548,6 +552,7 @@ DECISION_HTML = """
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
+    <a href="/sim">Simulation</a>
   </div>
 
   <h1>Decision</h1>
@@ -603,6 +608,7 @@ EVENTS_HTML = """
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
+    <a href="/sim">Simulation</a>
   </div>
 
   <h1>Events Log</h1>
@@ -628,6 +634,47 @@ EVENTS_HTML = """
       {% endfor %}
     </tbody>
   </table>
+</body>
+</html>
+"""
+
+
+SIM_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Simulation</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 820px; margin: 32px auto; padding: 0 16px; }
+    .nav a { margin-right: 12px; }
+    button { margin-top: 10px; padding: 10px 14px; border: 0; border-radius: 10px; cursor: pointer; }
+    .hint { color:#444; font-size: 0.92rem; }
+  </style>
+</head>
+<body>
+  <div class="nav">
+    <a href="/apply">Apply</a>
+    <a href="/review">Review Queue</a>
+    <a href="/recent">Recent Decisions</a>
+    <a href="/events">Events</a>
+    <a href="/sim">Simulation</a>
+  </div>
+
+  <h1>Simulation</h1>
+  <p class="hint">Generate synthetic loan applications using the normal rules engine. No forced outcomes.</p>
+
+  <form method="POST" action="/sim/gen?count=1" style="display:inline;">
+    <button type="submit">Generate 1 (random)</button>
+  </form>
+
+  <form method="POST" action="/sim/gen?count=10" style="display:inline; margin-left: 8px;">
+    <button type="submit">Generate 10 (random batch)</button>
+  </form>
+
+  <form method="POST" action="/sim/borderline" style="display:inline; margin-left: 8px;">
+    <button type="submit">Generate 1 (borderline / likely review)</button>
+  </form>
 </body>
 </html>
 """
@@ -809,6 +856,57 @@ def simulate_today():
 
     for s in samples:
         create_application_and_decide(s, source="simulated", sim_day=sim_day)
+
+    return redirect(url_for("recent"))
+
+
+@APP.get("/sim")
+def sim_page():
+    return render_template_string(SIM_HTML)
+
+
+@APP.post("/sim/gen")
+def sim_gen():
+    import random, string
+    count = min(int(request.args.get("count", 1)), 50)
+    rng = random.Random()
+    today = datetime.now(timezone.utc).date().strftime("%Y%m%d")
+
+    for _ in range(count):
+        tag = "".join(rng.choices(string.ascii_lowercase + string.digits, k=5))
+        name = f"sim-{today}-{tag}"
+        inp = AppInput(
+            applicant_name=name,
+            annual_income=rng.randint(25000, 150000),
+            loan_amount=rng.randint(5000, 120000),
+            credit_score=rng.randint(450, 820),
+            employment_years=round(rng.uniform(0.0, 15.0), 1),
+        )
+        create_application_and_decide(inp, source="sim")
+
+    return redirect(url_for("recent"))
+
+
+@APP.post("/sim/borderline")
+def sim_borderline():
+    import random, string
+    rng = random.Random()
+    today = datetime.now(timezone.utc).date().strftime("%Y%m%d")
+    tag = "".join(rng.choices(string.ascii_lowercase + string.digits, k=5))
+    name = f"sim-{today}-{tag}"
+
+    annual_income = rng.randint(40000, 100000)
+    dti_ratio = round(rng.uniform(0.35, 0.55), 2)
+    loan_amount = int(annual_income * dti_ratio)
+
+    inp = AppInput(
+        applicant_name=name,
+        annual_income=annual_income,
+        loan_amount=loan_amount,
+        credit_score=rng.randint(560, 660),
+        employment_years=round(rng.uniform(0.2, 2.0), 1),
+    )
+    create_application_and_decide(inp, source="sim")
 
     return redirect(url_for("recent"))
 
