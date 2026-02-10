@@ -81,6 +81,24 @@ def init_db() -> None:
                 num_created INTEGER NOT NULL,
                 UNIQUE(sim_day, run_id)
             );
+
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                application_id INTEGER,
+                decision_id INTEGER,
+                review_task_id INTEGER,
+                engine_version TEXT,
+                risk_score REAL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
+            CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type);
+            CREATE INDEX IF NOT EXISTS idx_events_application_id ON events(application_id);
+            CREATE INDEX IF NOT EXISTS idx_events_decision_id ON events(decision_id);
             """
         )
 
@@ -140,9 +158,60 @@ def migrate_db() -> None:
         except Exception:
             pass
 
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                application_id INTEGER,
+                decision_id INTEGER,
+                review_task_id INTEGER,
+                engine_version TEXT,
+                risk_score REAL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
+            CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type);
+            CREATE INDEX IF NOT EXISTS idx_events_application_id ON events(application_id);
+            CREATE INDEX IF NOT EXISTS idx_events_decision_id ON events(decision_id);
+        """)
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def log_event(
+    conn: sqlite3.Connection,
+    event_type: str,
+    actor: str,
+    application_id: int | None = None,
+    decision_id: int | None = None,
+    review_task_id: int | None = None,
+    engine_version: str | None = None,
+    risk_score: float | None = None,
+    metadata: dict | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO events
+          (created_at, event_type, actor, application_id, decision_id,
+           review_task_id, engine_version, risk_score, metadata_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            utc_now_iso(),
+            event_type,
+            actor,
+            application_id,
+            decision_id,
+            review_task_id,
+            engine_version,
+            risk_score,
+            json.dumps(metadata or {}, default=str),
+        ),
+    )
 
 
 # -----------------------------
@@ -240,6 +309,7 @@ APPLY_HTML = """
     <a href="/apply">Apply</a>
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
+    <a href="/events">Events</a>
   </div>
 
   <h1>Loan Application (Simulator)</h1>
@@ -303,6 +373,7 @@ RESULT_HTML = """
     <a href="/apply">Apply</a>
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
+    <a href="/events">Events</a>
   </div>
 
   <h1>Decision</h1>
@@ -349,6 +420,7 @@ REVIEW_HTML = """
     <a href="/apply">Apply</a>
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
+    <a href="/events">Events</a>
   </div>
 
   <h1>Human Review Queue</h1>
@@ -427,6 +499,7 @@ RECENT_HTML = """
     <a href="/apply">Apply</a>
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
+    <a href="/events">Events</a>
   </div>
 
   <h1>Recent Decisions</h1>
@@ -474,6 +547,7 @@ DECISION_HTML = """
     <a href="/apply">Apply</a>
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
+    <a href="/events">Events</a>
   </div>
 
   <h1>Decision</h1>
@@ -504,6 +578,56 @@ DECISION_HTML = """
 
   <h3>Raw explanation JSON</h3>
   <pre>{{reason_details_json}}</pre>
+</body>
+</html>
+"""
+
+
+EVENTS_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Events Log</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 1200px; margin: 32px auto; padding: 0 16px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; font-size: 0.92rem; }
+    .nav a { margin-right: 12px; }
+    code { background:#f6f6f6; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="nav">
+    <a href="/apply">Apply</a>
+    <a href="/review">Review Queue</a>
+    <a href="/recent">Recent Decisions</a>
+    <a href="/events">Events</a>
+  </div>
+
+  <h1>Events Log</h1>
+  <p><a href="/events.json">JSON</a></p>
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th><th>Type</th><th>Actor</th><th>Applicant</th><th>Decision</th><th>Risk</th><th>Engine</th><th>Links</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in events %}
+        <tr>
+          <td><small>{{e["created_at"]}}</small></td>
+          <td><code>{{e["event_type"]}}</code></td>
+          <td>{{e["actor"]}}</td>
+          <td>{{e["applicant_name"] or ""}}</td>
+          <td>{{e["decision"] or ""}}</td>
+          <td>{% if e["risk_score"] is not none %}<code>{{e["risk_score"]}}</code>{% endif %}</td>
+          <td>{% if e["engine_version"] %}<code>{{e["engine_version"]}}</code>{% endif %}</td>
+          <td>{% if e["decision_id"] %}<a href="/decision/{{e['decision_id']}}">decision</a>{% endif %}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
 </body>
 </html>
 """
@@ -542,6 +666,18 @@ def create_application_and_decide(inp: AppInput, source: str = "manual", sim_day
         )
         app_id = cur.lastrowid
 
+        log_event(conn, "APPLICATION_SUBMITTED",
+                  actor="human" if source == "manual" else "system",
+                  application_id=app_id,
+                  metadata={
+                      "applicant_name": inp.applicant_name,
+                      "annual_income": inp.annual_income,
+                      "loan_amount": inp.loan_amount,
+                      "credit_score": inp.credit_score,
+                      "employment_years": inp.employment_years,
+                      "source": source,
+                  })
+
         cur = conn.execute(
             """
             INSERT INTO decisions (application_id, created_at, engine_version, risk_score, decision)
@@ -561,11 +697,38 @@ def create_application_and_decide(inp: AppInput, source: str = "manual", sim_day
              json.dumps(reason_details)),
         )
 
+        log_event(conn, "AUTO_DECISION_MADE",
+                  actor="system",
+                  application_id=app_id,
+                  decision_id=decision_id,
+                  engine_version=ENGINE_VERSION,
+                  risk_score=float(round(risk_score, 4)),
+                  metadata={
+                      "decision": decision,
+                      "reason_codes": [d["code"] for d in reason_details],
+                      "approve_threshold": 0.45,
+                      "review_threshold": 0.55,
+                  })
+
+        review_task_id = None
         if needs_review:
-            conn.execute(
+            cur2 = conn.execute(
                 "INSERT INTO review_tasks (decision_id, created_at, status) VALUES (?, ?, 'PENDING')",
                 (decision_id, created_at),
             )
+            review_task_id = cur2.lastrowid
+
+            log_event(conn, "SENT_TO_HUMAN_REVIEW",
+                      actor="system",
+                      application_id=app_id,
+                      decision_id=decision_id,
+                      review_task_id=review_task_id,
+                      engine_version=ENGINE_VERSION,
+                      risk_score=float(round(risk_score, 4)),
+                      metadata={
+                          "reason": "risk_in_review_band" if 0.45 <= risk_score <= 0.55 else "forced_review_rule",
+                          "decision": decision,
+                      })
 
     return decision, risk_score, reason_details
 
@@ -732,6 +895,20 @@ def resolve_task(task_id: int):
             (outcome, row["decision_id"]),
         )
 
+        dec_row = conn.execute(
+            "SELECT application_id FROM decisions WHERE id = ?", (row["decision_id"],)
+        ).fetchone()
+        app_id = dec_row["application_id"] if dec_row else None
+
+        event_type = "HUMAN_APPROVED" if outcome == "APPROVE" else "HUMAN_REJECTED"
+        log_event(conn, event_type,
+                  actor="human",
+                  application_id=app_id,
+                  decision_id=row["decision_id"],
+                  review_task_id=task_id,
+                  engine_version="human-override-v1",
+                  metadata={"notes": notes, "outcome": outcome})
+
     return redirect(url_for("review_queue"))
 
 
@@ -829,6 +1006,39 @@ def decision_page(lookup_id: int):
         reasons=reasons,
         reason_details_json=raw_json,
     )
+
+
+def _fetch_events(limit: int = 200):
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+              ev.id, ev.created_at, ev.event_type, ev.actor,
+              ev.application_id, ev.decision_id, ev.review_task_id,
+              ev.engine_version, ev.risk_score, ev.metadata_json,
+              a.applicant_name,
+              d.decision
+            FROM events ev
+            LEFT JOIN applications a ON a.id = ev.application_id
+            LEFT JOIN decisions d ON d.id = ev.decision_id
+            ORDER BY ev.created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@APP.get("/events")
+def events_page():
+    events = _fetch_events(200)
+    return render_template_string(EVENTS_HTML, events=events)
+
+
+@APP.get("/events.json")
+def events_json():
+    events = _fetch_events(200)
+    return jsonify(events)
 
 
 @APP.get("/dbinfo")

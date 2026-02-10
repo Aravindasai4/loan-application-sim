@@ -30,12 +30,14 @@ When a reviewer approves/rejects a REVIEW case, the decisions table is updated w
 - `POST /review/<id>/resolve` - Approve/reject a review task
 - `GET /recent` - Recent decisions list
 - `GET /decision/<id>` - Decision detail page (accepts decision_id or application_id)
+- `GET /events` - Audit events log (HTML table, last 200 events)
+- `GET /events.json` - Audit events log (JSON, last 200 events)
 - `GET /dbinfo` - Debug info (JSON)
 
 ## Database
 - Uses absolute path: `BASE_DIR/loan_sim.db`
 - Single persistent DB file across all routes and restarts
-- Tables: applications, decisions, explanations, review_tasks, simulation_runs
+- Tables: applications, decisions, explanations, review_tasks, simulation_runs, events
 
 ## Running
 ```bash
@@ -49,3 +51,4 @@ Autoscale deployment using gunicorn: `gunicorn --bind=0.0.0.0:5000 --reuse-port 
 ## Recent Changes
 - Feb 2026: Fixed persistent DB path, human override logic, decision detail page, added /dbinfo
 - Feb 2026: Updated simulation_runs to support multiple runs per day with (sim_day, run_id) uniqueness. Naming pattern: sim-YYYY-MM-DD-R{run_id}-A/B/C. RNG seeded with "{sim_day}-R{run_id}" for unique results per run.
+- Feb 2026: Added audit-grade events log. Events table tracks APPLICATION_SUBMITTED, AUTO_DECISION_MADE, SENT_TO_HUMAN_REVIEW, HUMAN_APPROVED, HUMAN_REJECTED with actor, metadata, and links to applications/decisions. Viewable at /events and /events.json.

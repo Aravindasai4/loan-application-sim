@@ -1,0 +1,58 @@
+Edit main.py only. Do not create new files.
+
+GOAL:
+Add an audit-grade events log for the loan simulator so we can measure system behavior over time.
+
+WHAT TO ADD:
+
+1) Create a new SQLite table `events` in init_db() + migrate_db():
+
+Schema:
+- id INTEGER PRIMARY KEY AUTOINCREMENT
+- created_at TEXT NOT NULL
+- event_type TEXT NOT NULL              -- e.g., APPLICATION_SUBMITTED, AUTO_DECISION_MADE, SENT_TO_HUMAN_REVIEW, HUMAN_APPROVED, HUMAN_REJECTED
+- actor TEXT NOT NULL                   -- "system" or "human"
+- application_id INTEGER                -- nullable
+- decision_id INTEGER                   -- nullable
+- review_task_id INTEGER                -- nullable
+- engine_version TEXT                   -- nullable
+- risk_score REAL                       -- nullable
+- metadata_json TEXT NOT NULL DEFAULT '{}'  -- JSON string with extra details (inputs, reasons, notes, thresholds)
+Indexes:
+- index on created_at
+- index on event_type
+- index on application_id
+- index on decision_id
+
+2) Add a helper function log_event(...):
+log_event(conn, event_type, actor, application_id=None, decision_id=None, review_task_id=None, engine_version=None, risk_score=None, metadata=dict)
+- store metadata as json.dumps(metadata, default=str)
+- created_at uses existing utc_now_iso()
+
+3) Insert events at these points (do not change behavior):
+A) When an application is submitted (manual apply route):
+- log APPLICATION_SUBMITTED (actor="user" or "human"; pick "human" for simplicity) with metadata containing inputs (income, loan, score, empY, applicant_name, source)
+
+B) When the engine produces an automatic decision:
+- log AUTO_DECISION_MADE (actor="system") with decision_id, application_id, engine_version, risk_score, and metadata containing top reason codes (list) and threshold values used
+
+C) When a case is routed to human review:
+- log SENT_TO_HUMAN_REVIEW (actor="system") with decision_id, application_id, review_task_id and metadata including why it was routed (e.g., risk band)
+
+D) When human resolves a review task (approve/reject):
+- log HUMAN_APPROVED or HUMAN_REJECTED (actor="human") with decision_id, review_task_id, engine_version="human-override-v1"
+- metadata should include the human notes field
+
+4) Add a page to view events:
+Add GET /events that renders a simple table of last 200 events:
+Time | Type | Actor | Applicant | Decision | Risk | Engine | Links
+- Join to applications/decisions to show applicant_name
+- Include clickable link to /decision/<decision_id> when available
+
+5) Add GET /events.json that returns last 200 events as JSON.
+
+CONSTRAINTS:
+- main.py only
+- no external packages
+- do not break existing routes
+- do not change styling significantly (simple table is fine)
