@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
+import traceback
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple
 
 from flask import Flask, request, redirect, url_for, render_template_string, abort, jsonify
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 APP = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -100,6 +104,35 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type);
             CREATE INDEX IF NOT EXISTS idx_events_application_id ON events(application_id);
             CREATE INDEX IF NOT EXISTS idx_events_decision_id ON events(decision_id);
+
+            CREATE TABLE IF NOT EXISTS daily_metrics (
+                day TEXT PRIMARY KEY,
+                total INTEGER,
+                approve INTEGER,
+                review INTEGER,
+                reject INTEGER,
+                avg_risk REAL,
+                max_risk REAL,
+                review_rate REAL,
+                avg_income REAL,
+                avg_loan REAL,
+                avg_credit REAL,
+                avg_emp_years REAL,
+                reason_counts_json TEXT,
+                updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT,
+                day TEXT,
+                severity TEXT,
+                alert_type TEXT,
+                message TEXT,
+                details_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_alerts_day ON alerts(day);
+            CREATE INDEX IF NOT EXISTS idx_alerts_type ON alerts(alert_type);
             """
         )
 
@@ -182,6 +215,36 @@ def migrate_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_events_decision_id ON events(decision_id);
         """)
 
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS daily_metrics (
+                day TEXT PRIMARY KEY,
+                total INTEGER,
+                approve INTEGER,
+                review INTEGER,
+                reject INTEGER,
+                avg_risk REAL,
+                max_risk REAL,
+                review_rate REAL,
+                avg_income REAL,
+                avg_loan REAL,
+                avg_credit REAL,
+                avg_emp_years REAL,
+                reason_counts_json TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT,
+                day TEXT,
+                severity TEXT,
+                alert_type TEXT,
+                message TEXT,
+                details_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_alerts_day ON alerts(day);
+            CREATE INDEX IF NOT EXISTS idx_alerts_type ON alerts(alert_type);
+        """)
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -217,6 +280,175 @@ def log_event(
             json.dumps(metadata or {}, default=str),
         ),
     )
+
+
+# -----------------------------
+# Drift & Stability (v0.3)
+# -----------------------------
+def compute_daily_metrics_and_alerts(conn: sqlite3.Connection, lookback_days: int = 30) -> None:
+    try:
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+        rows = conn.execute(
+            """
+            SELECT
+                DATE(d.created_at) AS day,
+                COUNT(*) AS total,
+                SUM(CASE WHEN d.decision = 'APPROVE' THEN 1 ELSE 0 END) AS approve,
+                SUM(CASE WHEN d.decision = 'REVIEW' THEN 1 ELSE 0 END) AS review,
+                SUM(CASE WHEN d.decision = 'REJECT' THEN 1 ELSE 0 END) AS reject,
+                AVG(d.risk_score) AS avg_risk,
+                MAX(d.risk_score) AS max_risk,
+                AVG(a.annual_income) AS avg_income,
+                AVG(a.loan_amount) AS avg_loan,
+                AVG(a.credit_score) AS avg_credit,
+                AVG(a.employment_years) AS avg_emp_years
+            FROM decisions d
+            JOIN applications a ON a.id = d.application_id
+            WHERE DATE(d.created_at) >= ?
+            GROUP BY DATE(d.created_at)
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        updated_at = utc_now_iso()
+
+        for r in rows:
+            day = r["day"]
+            total = r["total"] or 0
+            review_count = r["review"] or 0
+            review_rate = review_count / total if total > 0 else 0.0
+
+            reason_rows = conn.execute(
+                """
+                SELECT e.reason_details_json
+                FROM explanations e
+                JOIN decisions d ON d.id = e.decision_id
+                WHERE DATE(d.created_at) = ?
+                """,
+                (day,),
+            ).fetchall()
+
+            reason_counts: Dict[str, int] = {}
+            for rr in reason_rows:
+                try:
+                    details = json.loads(rr["reason_details_json"] or "[]")
+                    for item in details:
+                        if isinstance(item, dict) and "code" in item:
+                            reason_counts[item["code"]] = reason_counts.get(item["code"], 0) + 1
+                except Exception:
+                    pass
+
+            conn.execute(
+                """
+                INSERT INTO daily_metrics
+                    (day, total, approve, review, reject, avg_risk, max_risk,
+                     review_rate, avg_income, avg_loan, avg_credit, avg_emp_years,
+                     reason_counts_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(day) DO UPDATE SET
+                    total=excluded.total, approve=excluded.approve,
+                    review=excluded.review, reject=excluded.reject,
+                    avg_risk=excluded.avg_risk, max_risk=excluded.max_risk,
+                    review_rate=excluded.review_rate,
+                    avg_income=excluded.avg_income, avg_loan=excluded.avg_loan,
+                    avg_credit=excluded.avg_credit, avg_emp_years=excluded.avg_emp_years,
+                    reason_counts_json=excluded.reason_counts_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    day, total, r["approve"] or 0, review_count, r["reject"] or 0,
+                    round(r["avg_risk"] or 0, 6), round(r["max_risk"] or 0, 6),
+                    round(review_rate, 6),
+                    round(r["avg_income"] or 0, 2), round(r["avg_loan"] or 0, 2),
+                    round(r["avg_credit"] or 0, 2), round(r["avg_emp_years"] or 0, 2),
+                    json.dumps(reason_counts), updated_at,
+                ),
+            )
+
+        today_str = now.strftime("%Y-%m-%d")
+        today_row = conn.execute(
+            "SELECT * FROM daily_metrics WHERE day = ?", (today_str,)
+        ).fetchone()
+
+        if not today_row or (today_row["total"] or 0) < 10:
+            return
+
+        baseline_start = (now - timedelta(days=8)).strftime("%Y-%m-%d")
+        baseline_end = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        baseline = conn.execute(
+            """
+            SELECT
+                AVG(review_rate) AS review_rate,
+                AVG(avg_risk) AS avg_risk,
+                AVG(avg_credit) AS avg_credit,
+                AVG(avg_income) AS avg_income,
+                COUNT(*) AS n_days
+            FROM daily_metrics
+            WHERE day >= ? AND day <= ?
+            """,
+            (baseline_start, baseline_end),
+        ).fetchone()
+
+        if not baseline or (baseline["n_days"] or 0) == 0:
+            return
+
+        signals = []
+        t_rr = today_row["review_rate"] or 0
+        b_rr = baseline["review_rate"] or 0
+        if t_rr > b_rr + 0.10:
+            signals.append(("REVIEW_RATE_SPIKE", "WARN",
+                f"Review rate {t_rr:.2%} vs baseline {b_rr:.2%} (+{(t_rr - b_rr):.2%})",
+                {"today": round(t_rr, 4), "baseline": round(b_rr, 4)}))
+
+        t_ar = today_row["avg_risk"] or 0
+        b_ar = baseline["avg_risk"] or 0
+        if t_ar > b_ar + 0.15:
+            signals.append(("RISK_SPIKE", "WARN",
+                f"Avg risk {t_ar:.4f} vs baseline {b_ar:.4f} (+{(t_ar - b_ar):.4f})",
+                {"today": round(t_ar, 4), "baseline": round(b_ar, 4)}))
+
+        t_ac = today_row["avg_credit"] or 0
+        b_ac = baseline["avg_credit"] or 0
+        if abs(t_ac - b_ac) >= 40:
+            signals.append(("CREDIT_SHIFT", "WARN",
+                f"Avg credit score {t_ac:.0f} vs baseline {b_ac:.0f} (shift {t_ac - b_ac:+.0f})",
+                {"today": round(t_ac, 2), "baseline": round(b_ac, 2)}))
+
+        t_ai = today_row["avg_income"] or 0
+        b_ai = baseline["avg_income"] or 0
+        if b_ai > 0 and abs(t_ai - b_ai) / b_ai >= 0.25:
+            signals.append(("INCOME_SHIFT", "WARN",
+                f"Avg income ${t_ai:,.0f} vs baseline ${b_ai:,.0f} ({((t_ai - b_ai) / b_ai):+.1%})",
+                {"today": round(t_ai, 2), "baseline": round(b_ai, 2)}))
+
+        now_iso = utc_now_iso()
+        for alert_type, severity, message, details in signals:
+            exists = conn.execute(
+                "SELECT 1 FROM alerts WHERE day = ? AND alert_type = ?",
+                (today_str, alert_type),
+            ).fetchone()
+            if not exists:
+                conn.execute(
+                    """
+                    INSERT INTO alerts (created_at, day, severity, alert_type, message, details_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (now_iso, today_str, severity, alert_type, message, json.dumps(details)),
+                )
+
+    except Exception:
+        logging.error("compute_daily_metrics_and_alerts failed:\n%s", traceback.format_exc())
+
+
+def trigger_metrics_refresh():
+    try:
+        with db() as conn:
+            compute_daily_metrics_and_alerts(conn)
+    except Exception:
+        logging.error("trigger_metrics_refresh failed:\n%s", traceback.format_exc())
 
 
 # -----------------------------
@@ -347,6 +579,7 @@ APPLY_HTML = """
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
+    <a href="/alerts">Alerts</a>
     <a href="/sim">Simulation</a>
     <a href="/dashboard">Dashboard</a>
   </div>
@@ -413,6 +646,7 @@ RESULT_HTML = """
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
+    <a href="/alerts">Alerts</a>
     <a href="/sim">Simulation</a>
     <a href="/dashboard">Dashboard</a>
   </div>
@@ -466,6 +700,7 @@ REVIEW_HTML = """
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
+    <a href="/alerts">Alerts</a>
     <a href="/sim">Simulation</a>
     <a href="/dashboard">Dashboard</a>
   </div>
@@ -547,6 +782,7 @@ RECENT_HTML = """
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
+    <a href="/alerts">Alerts</a>
     <a href="/sim">Simulation</a>
     <a href="/dashboard">Dashboard</a>
   </div>
@@ -597,6 +833,7 @@ DECISION_HTML = """
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
+    <a href="/alerts">Alerts</a>
     <a href="/sim">Simulation</a>
     <a href="/dashboard">Dashboard</a>
   </div>
@@ -658,6 +895,7 @@ EVENTS_HTML = """
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
+    <a href="/alerts">Alerts</a>
     <a href="/sim">Simulation</a>
     <a href="/dashboard">Dashboard</a>
   </div>
@@ -705,6 +943,10 @@ DASHBOARD_HTML = """
     h2 { margin-top: 32px; }
     code { background:#f6f6f6; padding: 2px 6px; border-radius: 6px; }
     .warn { color: #b45309; font-weight: 600; }
+    .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.85rem; font-weight: 600; }
+    .INFO { background:#e0f0ff; color:#1a5276; }
+    .WARN { background:#fff3cd; color:#856404; }
+    .CRITICAL { background:#f8d7da; color:#721c24; }
   </style>
 </head>
 <body>
@@ -713,6 +955,7 @@ DASHBOARD_HTML = """
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
+    <a href="/alerts">Alerts</a>
     <a href="/sim">Simulation</a>
     <a href="/dashboard">Dashboard</a>
   </div>
@@ -762,6 +1005,114 @@ DASHBOARD_HTML = """
   <p>
     Pending review tasks: <b{% if pending_reviews > 0 %} class="warn"{% endif %}>{{pending_reviews}}</b>
   </p>
+
+  <h2>Drift (last 14 days)</h2>
+  {% if drift_rows|length == 0 %}
+    <p>No daily metrics available yet.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>Day</th><th>Total</th><th>Review Rate</th><th>Avg Risk</th>
+        <th>Avg Credit</th><th>Avg Income</th><th>Flags</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for dr in drift_rows %}
+      <tr>
+        <td>{{dr.day}}</td>
+        <td>{{dr.total}}</td>
+        <td><code>{{dr.review_rate}}</code></td>
+        <td><code>{{dr.avg_risk}}</code></td>
+        <td><code>{{dr.avg_credit}}</code></td>
+        <td><code>{{dr.avg_income}}</code></td>
+        <td>
+          {% for f in dr.flags %}<span class="warn">{{f}}</span> {% endfor %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <h2>Alerts (recent)</h2>
+  {% if recent_alerts|length == 0 %}
+    <p>No alerts.</p>
+  {% else %}
+  <table>
+    <thead><tr><th>Time</th><th>Day</th><th>Severity</th><th>Type</th><th>Message</th></tr></thead>
+    <tbody>
+      {% for al in recent_alerts %}
+      <tr>
+        <td><small>{{al.created_at}}</small></td>
+        <td>{{al.day}}</td>
+        <td><span class="pill {{al.severity}}">{{al.severity}}</span></td>
+        <td><code>{{al.alert_type}}</code></td>
+        <td>{{al.message}}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</body>
+</html>
+"""
+
+
+ALERTS_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Alerts</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 1200px; margin: 32px auto; padding: 0 16px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; font-size: 0.92rem; }
+    .nav a { margin-right: 12px; }
+    code { background:#f6f6f6; padding: 2px 6px; border-radius: 6px; }
+    .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.85rem; font-weight: 600; }
+    .INFO { background:#e0f0ff; color:#1a5276; }
+    .WARN { background:#fff3cd; color:#856404; }
+    .CRITICAL { background:#f8d7da; color:#721c24; }
+  </style>
+</head>
+<body>
+  <div class="nav">
+    <a href="/apply">Apply</a>
+    <a href="/review">Review Queue</a>
+    <a href="/recent">Recent Decisions</a>
+    <a href="/events">Events</a>
+    <a href="/alerts">Alerts</a>
+    <a href="/sim">Simulation</a>
+    <a href="/dashboard">Dashboard</a>
+  </div>
+
+  <h1>Alerts</h1>
+  <p><a href="/alerts.json">JSON</a> | <a href="/dashboard">Dashboard</a></p>
+
+  {% if alerts|length == 0 %}
+    <p>No alerts recorded yet.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th><th>Day</th><th>Severity</th><th>Type</th><th>Message</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for a in alerts %}
+      <tr>
+        <td><small>{{a["created_at"]}}</small></td>
+        <td>{{a["day"]}}</td>
+        <td><span class="pill {{a['severity']}}">{{a["severity"]}}</span></td>
+        <td><code>{{a["alert_type"]}}</code></td>
+        <td>{{a["message"]}}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
 </body>
 </html>
 """
@@ -786,6 +1137,7 @@ SIM_HTML = """
     <a href="/review">Review Queue</a>
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
+    <a href="/alerts">Alerts</a>
     <a href="/sim">Simulation</a>
     <a href="/dashboard">Dashboard</a>
   </div>
@@ -940,6 +1292,7 @@ def apply_post():
     )
 
     decision, risk_score, reason_details = create_application_and_decide(inp, source="manual")
+    trigger_metrics_refresh()
 
     return render_template_string(
         RESULT_HTML,
@@ -987,6 +1340,7 @@ def simulate_today():
     for s in samples:
         create_application_and_decide(s, source="simulated", sim_day=sim_day)
 
+    trigger_metrics_refresh()
     return redirect(url_for("recent"))
 
 
@@ -1014,6 +1368,7 @@ def sim_gen():
         )
         create_application_and_decide(inp, source="sim")
 
+    trigger_metrics_refresh()
     return redirect(url_for("recent"))
 
 
@@ -1038,13 +1393,13 @@ def sim_borderline():
     )
     create_application_and_decide(inp, source="sim")
 
+    trigger_metrics_refresh()
     return redirect(url_for("recent"))
 
 
 @APP.get("/dashboard")
 def dashboard():
     from collections import Counter
-    from datetime import timedelta
 
     now = datetime.now(timezone.utc)
     cutoff_24h = (now - timedelta(hours=24)).isoformat()
@@ -1122,11 +1477,50 @@ def dashboard():
         ).fetchone()
         pending_reviews = pending_row["c"] or 0
 
+        cutoff_14d = (now - timedelta(days=14)).strftime("%Y-%m-%d")
+        drift_metric_rows = conn.execute(
+            "SELECT * FROM daily_metrics WHERE day >= ? ORDER BY day DESC",
+            (cutoff_14d,),
+        ).fetchall()
+
+        drift_rows = []
+        for dm in drift_metric_rows:
+            day = dm["day"]
+            alert_types_rows = conn.execute(
+                "SELECT alert_type FROM alerts WHERE day = ?", (day,)
+            ).fetchall()
+            alert_types = {r["alert_type"] for r in alert_types_rows}
+            flags = []
+            if "REVIEW_RATE_SPIKE" in alert_types:
+                flags.append("review spike")
+            if "RISK_SPIKE" in alert_types:
+                flags.append("risk spike")
+            if "CREDIT_SHIFT" in alert_types:
+                flags.append("credit shift")
+            if "INCOME_SHIFT" in alert_types:
+                flags.append("income shift")
+            drift_rows.append({
+                "day": day,
+                "total": dm["total"] or 0,
+                "review_rate": f"{(dm['review_rate'] or 0):.2%}",
+                "avg_risk": round(dm["avg_risk"] or 0, 4),
+                "avg_credit": round(dm["avg_credit"] or 0, 0),
+                "avg_income": f"${(dm['avg_income'] or 0):,.0f}",
+                "flags": flags,
+            })
+
+        recent_alert_rows = conn.execute(
+            "SELECT * FROM alerts ORDER BY created_at DESC LIMIT 10"
+        ).fetchall()
+        recent_alerts = [dict(r) for r in recent_alert_rows]
+
     return render_template_string(
         DASHBOARD_HTML,
         windows=windows,
         reason_codes=reason_codes,
         pending_reviews=pending_reviews,
+        drift_rows=drift_rows,
+        recent_alerts=recent_alerts,
     )
 
 
@@ -1226,6 +1620,7 @@ def resolve_task(task_id: int):
                   engine_version="human-override-v1",
                   metadata={"notes": notes, "outcome": outcome})
 
+    trigger_metrics_refresh()
     return redirect(url_for("review_queue"))
 
 
@@ -1359,6 +1754,52 @@ def events_page():
 def events_json():
     events = _fetch_events(200)
     return jsonify(events)
+
+
+@APP.get("/metrics/daily.json")
+def metrics_daily_json():
+    with db() as conn:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+        rows = conn.execute(
+            "SELECT * FROM daily_metrics WHERE day >= ? ORDER BY day ASC",
+            (cutoff,),
+        ).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["reason_counts"] = json.loads(d.pop("reason_counts_json", "{}") or "{}")
+        except Exception:
+            d["reason_counts"] = {}
+        result.append(d)
+    return jsonify(result)
+
+
+@APP.get("/alerts")
+def alerts_page():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM alerts ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+    alerts = [dict(r) for r in rows]
+    return render_template_string(ALERTS_HTML, alerts=alerts)
+
+
+@APP.get("/alerts.json")
+def alerts_json():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM alerts ORDER BY created_at DESC LIMIT 200"
+        ).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["details"] = json.loads(d.pop("details_json", "{}") or "{}")
+        except Exception:
+            d["details"] = {}
+        result.append(d)
+    return jsonify(result)
 
 
 @APP.get("/dbinfo")
