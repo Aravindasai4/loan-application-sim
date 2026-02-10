@@ -311,6 +311,7 @@ APPLY_HTML = """
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
     <a href="/sim">Simulation</a>
+    <a href="/dashboard">Dashboard</a>
   </div>
 
   <h1>Loan Application (Simulator)</h1>
@@ -376,6 +377,7 @@ RESULT_HTML = """
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
     <a href="/sim">Simulation</a>
+    <a href="/dashboard">Dashboard</a>
   </div>
 
   <h1>Decision</h1>
@@ -424,6 +426,7 @@ REVIEW_HTML = """
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
     <a href="/sim">Simulation</a>
+    <a href="/dashboard">Dashboard</a>
   </div>
 
   <h1>Human Review Queue</h1>
@@ -504,6 +507,7 @@ RECENT_HTML = """
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
     <a href="/sim">Simulation</a>
+    <a href="/dashboard">Dashboard</a>
   </div>
 
   <h1>Recent Decisions</h1>
@@ -553,6 +557,7 @@ DECISION_HTML = """
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
     <a href="/sim">Simulation</a>
+    <a href="/dashboard">Dashboard</a>
   </div>
 
   <h1>Decision</h1>
@@ -609,6 +614,7 @@ EVENTS_HTML = """
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
     <a href="/sim">Simulation</a>
+    <a href="/dashboard">Dashboard</a>
   </div>
 
   <h1>Events Log</h1>
@@ -639,6 +645,83 @@ EVENTS_HTML = """
 """
 
 
+DASHBOARD_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 1100px; margin: 32px auto; padding: 0 16px; }
+    .nav a { margin-right: 12px; }
+    table { border-collapse: collapse; margin-bottom: 24px; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px 14px; text-align: left; }
+    th { background: #fafafa; }
+    h2 { margin-top: 32px; }
+    code { background:#f6f6f6; padding: 2px 6px; border-radius: 6px; }
+    .warn { color: #b45309; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="nav">
+    <a href="/apply">Apply</a>
+    <a href="/review">Review Queue</a>
+    <a href="/recent">Recent Decisions</a>
+    <a href="/events">Events</a>
+    <a href="/sim">Simulation</a>
+    <a href="/dashboard">Dashboard</a>
+  </div>
+
+  <h1>Dashboard</h1>
+
+  <h2>Decision Summary</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Window</th><th>Total</th><th>Approve</th><th>Review</th><th>Reject</th>
+        <th>Review Rate</th><th>Avg Risk</th><th>Max Risk</th><th>Human Overrides</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for w in windows %}
+      <tr>
+        <td><b>{{w.label}}</b></td>
+        <td>{{w.total}}</td>
+        <td>{{w.approve}}</td>
+        <td>{{w.review}}</td>
+        <td>{{w.reject}}</td>
+        <td><code>{{w.review_rate}}</code></td>
+        <td><code>{{w.avg_risk}}</code></td>
+        <td><code>{{w.max_risk}}</code></td>
+        <td>{{w.human_overrides}}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Top Reason Codes (last 7 days)</h2>
+  {% if reason_codes|length == 0 %}
+    <p>No decisions in last 7 days.</p>
+  {% else %}
+  <table>
+    <thead><tr><th>Code</th><th>Count</th></tr></thead>
+    <tbody>
+      {% for rc in reason_codes %}
+      <tr><td><code>{{rc.code}}</code></td><td>{{rc.count}}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <h2>Stuck Review Queue</h2>
+  <p>
+    Pending review tasks: <b{% if pending_reviews > 0 %} class="warn"{% endif %}>{{pending_reviews}}</b>
+  </p>
+</body>
+</html>
+"""
+
+
 SIM_HTML = """
 <!doctype html>
 <html>
@@ -659,6 +742,7 @@ SIM_HTML = """
     <a href="/recent">Recent Decisions</a>
     <a href="/events">Events</a>
     <a href="/sim">Simulation</a>
+    <a href="/dashboard">Dashboard</a>
   </div>
 
   <h1>Simulation</h1>
@@ -909,6 +993,95 @@ def sim_borderline():
     create_application_and_decide(inp, source="sim")
 
     return redirect(url_for("recent"))
+
+
+@APP.get("/dashboard")
+def dashboard():
+    from collections import Counter
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    cutoff_24h = (now - timedelta(hours=24)).isoformat()
+    cutoff_7d = (now - timedelta(days=7)).isoformat()
+
+    windows = []
+    with db() as conn:
+        for label, cutoff in [("Last 24 hours", cutoff_24h), ("Last 7 days", cutoff_7d), ("All time", None)]:
+            where = "WHERE d.created_at >= ?" if cutoff else ""
+            params = (cutoff,) if cutoff else ()
+
+            row = conn.execute(
+                f"""
+                SELECT
+                  COUNT(*) AS total,
+                  SUM(CASE WHEN d.decision = 'APPROVE' THEN 1 ELSE 0 END) AS approve,
+                  SUM(CASE WHEN d.decision = 'REVIEW' THEN 1 ELSE 0 END) AS review,
+                  SUM(CASE WHEN d.decision = 'REJECT' THEN 1 ELSE 0 END) AS reject,
+                  AVG(d.risk_score) AS avg_risk,
+                  MAX(d.risk_score) AS max_risk
+                FROM decisions d
+                {where}
+                """,
+                params,
+            ).fetchone()
+
+            total = row["total"] or 0
+            review_count = row["review"] or 0
+            review_rate = round(review_count / total, 4) if total > 0 else 0.0
+
+            override_where = "WHERE ev.event_type IN ('HUMAN_APPROVED', 'HUMAN_REJECTED')"
+            if cutoff:
+                override_where += " AND ev.created_at >= ?"
+            override_row = conn.execute(
+                f"SELECT COUNT(*) AS c FROM events ev {override_where}",
+                params,
+            ).fetchone()
+
+            windows.append({
+                "label": label,
+                "total": total,
+                "approve": row["approve"] or 0,
+                "review": review_count,
+                "reject": row["reject"] or 0,
+                "review_rate": f"{review_rate:.2%}",
+                "avg_risk": round(row["avg_risk"] or 0, 4),
+                "max_risk": round(row["max_risk"] or 0, 4),
+                "human_overrides": override_row["c"] or 0,
+            })
+
+        reason_rows = conn.execute(
+            """
+            SELECT e.reason_details_json
+            FROM explanations e
+            JOIN decisions d ON d.id = e.decision_id
+            WHERE d.created_at >= ?
+            """,
+            (cutoff_7d,),
+        ).fetchall()
+
+        code_counter = Counter()
+        for r in reason_rows:
+            try:
+                details = json.loads(r["reason_details_json"] or "[]")
+                for item in details:
+                    if "code" in item:
+                        code_counter[item["code"]] += 1
+            except Exception:
+                pass
+
+        reason_codes = [{"code": code, "count": count} for code, count in code_counter.most_common(10)]
+
+        pending_row = conn.execute(
+            "SELECT COUNT(*) AS c FROM review_tasks WHERE status = 'PENDING'"
+        ).fetchone()
+        pending_reviews = pending_row["c"] or 0
+
+    return render_template_string(
+        DASHBOARD_HTML,
+        windows=windows,
+        reason_codes=reason_codes,
+        pending_reviews=pending_reviews,
+    )
 
 
 @APP.get("/review")
