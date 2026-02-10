@@ -12,7 +12,8 @@ from flask import Flask, request, redirect, url_for, render_template_string, abo
 APP = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "loan_sim.db")
-ENGINE_VERSION = "rules-v0.1"
+DECISION_CONTRACT_VERSION = "v0.2"
+ENGINE_VERSION = "rules-v0.2"
 
 
 # -----------------------------
@@ -110,6 +111,10 @@ def migrate_db() -> None:
             conn.execute("ALTER TABLE applications ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
         if "sim_day" not in cols:
             conn.execute("ALTER TABLE applications ADD COLUMN sim_day TEXT")
+
+        dec_cols = {row["name"] for row in conn.execute("PRAGMA table_info(decisions)").fetchall()}
+        if "decision_contract_version" not in dec_cols:
+            conn.execute("ALTER TABLE decisions ADD COLUMN decision_contract_version TEXT")
 
         sr_exists = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='simulation_runs'"
@@ -230,58 +235,90 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
-def compute_risk_and_reasons(inp: AppInput) -> Tuple[float, List[Dict]]:
-    dti = inp.loan_amount / max(inp.annual_income, 1.0)
-    credit_risk = clamp((720 - inp.credit_score) / 320.0, 0.0, 1.0)
-    dti_risk = clamp((dti - 0.15) / 0.85, 0.0, 1.0)
-    emp_risk = clamp((2.0 - inp.employment_years) / 2.0, 0.0, 1.0)
-    risk_score = clamp(0.55 * credit_risk + 0.30 * dti_risk + 0.15 * emp_risk, 0.0, 1.0)
+IMPACT_WEIGHTS = {
+    "CREDIT_SCORE_LOW": {"high": 0.35, "med": 0.18, "low": 0.05},
+    "DTI_HIGH": {"high": 0.30, "med": 0.15, "low": 0.05},
+    "EMPLOYMENT_SHORT": {"high": 0.20, "med": 0.10, "low": 0.03},
+}
 
-    details = [
+
+def compute_risk_and_reasons(inp: AppInput) -> Tuple[float, List[Dict], str]:
+    dti = inp.loan_amount / max(inp.annual_income, 1.0)
+
+    if inp.credit_score < 580:
+        credit_sev = "high"
+    elif inp.credit_score <= 669:
+        credit_sev = "med"
+    else:
+        credit_sev = "low"
+
+    if dti > 0.6:
+        dti_sev = "high"
+    elif dti >= 0.35:
+        dti_sev = "med"
+    else:
+        dti_sev = "low"
+
+    if inp.employment_years < 1:
+        emp_sev = "high"
+    elif inp.employment_years < 2:
+        emp_sev = "med"
+    else:
+        emp_sev = "low"
+
+    features = [
         {
             "code": "CREDIT_SCORE_LOW",
             "text": "Credit score is below the preferred range.",
             "value": inp.credit_score,
-            "impact": round(0.55 * credit_risk, 4),
+            "severity": credit_sev,
+            "impact": IMPACT_WEIGHTS["CREDIT_SCORE_LOW"][credit_sev],
         },
         {
             "code": "DTI_HIGH",
             "text": "Requested loan amount is high relative to annual income (DTI proxy).",
             "value": round(dti, 4),
-            "impact": round(0.30 * dti_risk, 4),
+            "severity": dti_sev,
+            "impact": IMPACT_WEIGHTS["DTI_HIGH"][dti_sev],
         },
         {
             "code": "EMPLOYMENT_SHORT",
             "text": "Employment history is short, which increases repayment uncertainty.",
             "value": inp.employment_years,
-            "impact": round(0.15 * emp_risk, 4),
+            "severity": emp_sev,
+            "impact": IMPACT_WEIGHTS["EMPLOYMENT_SHORT"][emp_sev],
         },
     ]
 
-    details.sort(key=lambda d: d["impact"], reverse=True)
-    return risk_score, details[:3]
+    risk_score = clamp(sum(f["impact"] for f in features), 0.0, 1.0)
+
+    if risk_score >= 0.70:
+        decision = "REJECT"
+    elif risk_score >= 0.40:
+        decision = "REVIEW"
+    else:
+        decision = "APPROVE"
+
+    if decision == "REJECT":
+        filtered = [f for f in features if f["severity"] == "high"]
+    elif decision == "REVIEW":
+        filtered = [f for f in features if f["severity"] in ("high", "med")]
+    else:
+        filtered = [f for f in features if f["severity"] in ("high", "med")]
+        if not filtered:
+            filtered = [{"code": "LOW_RISK", "text": "All risk factors are within acceptable range.", "value": round(risk_score, 4), "impact": 0.0, "severity": "low"}]
+        else:
+            filtered = filtered[:2]
+
+    filtered.sort(key=lambda d: d["impact"], reverse=True)
+    details = [{"code": f["code"], "text": f["text"], "value": f["value"], "impact": round(f["impact"], 4)} for f in filtered[:4]]
+
+    return risk_score, details, decision
 
 
-def decide(risk_score: float, inp: AppInput) -> Tuple[str, bool]:
-    approve_th = 0.45
-    review_th = 0.55
-
-    near_band = 0.03
-    near_threshold = (abs(risk_score - approve_th) <= near_band) or (abs(risk_score - review_th) <= near_band)
-
-    forced_review = False
-    if inp.credit_score < 520:
-        forced_review = True
-    if inp.annual_income <= 0 or inp.loan_amount <= 0:
-        forced_review = True
-
-    if forced_review or near_threshold:
-        return "REVIEW", True
-    if risk_score < approve_th:
-        return "APPROVE", False
-    if risk_score <= review_th:
-        return "REVIEW", True
-    return "REJECT", False
+def decide(risk_score: float, decision: str, inp: AppInput) -> Tuple[str, bool]:
+    needs_review = decision == "REVIEW"
+    return decision, needs_review
 
 
 # -----------------------------
@@ -389,11 +426,15 @@ RESULT_HTML = """
   </p>
 
   <h2>Top Reasons</h2>
+  {% if reasons %}
   <ul>
     {% for r in reasons %}
       <li><b>{{r["code"]}}</b>: {{r["text"]}} (value={{r["value"]}}, impact={{r["impact"]}})</li>
     {% endfor %}
   </ul>
+  {% else %}
+  <p>No significant risk factors identified.</p>
+  {% endif %}
 
   {% if decision == "REVIEW" %}
     <p><b>Human review required.</b> This case has been added to the review queue.</p>
@@ -566,7 +607,7 @@ DECISION_HTML = """
     Applicant: <b>{{applicant_name or "\u2014"}}</b>
     <span class="pill">{{decision}}</span>
     <span class="pill">risk={{risk_score}}</span>
-    <span class="pill">{{engine_version}}</span>
+    <span class="pill">{{engine_version}}{% if contract_version %} | contract {{contract_version}}{% endif %}</span>
   </p>
 
   <h2>Inputs</h2>
@@ -580,11 +621,15 @@ DECISION_HTML = """
   </ul>
 
   <h2>Top reasons</h2>
+  {% if reasons %}
   <ul>
   {% for r in reasons %}
     <li><b>{{r.code}}</b>: {{r.text}} (value={{r.value}}, impact={{r.impact}})</li>
   {% endfor %}
   </ul>
+  {% else %}
+  <p>No significant risk factors identified.</p>
+  {% endif %}
 
   <h3>Raw explanation JSON</h3>
   <pre>{{reason_details_json}}</pre>
@@ -770,8 +815,8 @@ SIM_HTML = """
 
 
 def create_application_and_decide(inp: AppInput, source: str = "manual", sim_day: str | None = None):
-    risk_score, reason_details = compute_risk_and_reasons(inp)
-    decision, needs_review = decide(risk_score, inp)
+    risk_score, reason_details, decision_outcome = compute_risk_and_reasons(inp)
+    decision, needs_review = decide(risk_score, decision_outcome, inp)
 
     created_at = utc_now_iso()
     raw = {
@@ -811,10 +856,10 @@ def create_application_and_decide(inp: AppInput, source: str = "manual", sim_day
 
         cur = conn.execute(
             """
-            INSERT INTO decisions (application_id, created_at, engine_version, risk_score, decision)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO decisions (application_id, created_at, engine_version, risk_score, decision, decision_contract_version)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (app_id, created_at, ENGINE_VERSION, float(round(risk_score, 4)), decision),
+            (app_id, created_at, ENGINE_VERSION, float(round(risk_score, 4)), decision, DECISION_CONTRACT_VERSION),
         )
         decision_id = cur.lastrowid
 
@@ -837,8 +882,9 @@ def create_application_and_decide(inp: AppInput, source: str = "manual", sim_day
                   metadata={
                       "decision": decision,
                       "reason_codes": [d["code"] for d in reason_details],
-                      "approve_threshold": 0.45,
-                      "review_threshold": 0.55,
+                      "approve_threshold": 0.40,
+                      "review_threshold": 0.70,
+                      "decision_contract_version": DECISION_CONTRACT_VERSION,
                   })
 
         review_task_id = None
@@ -857,7 +903,7 @@ def create_application_and_decide(inp: AppInput, source: str = "manual", sim_day
                       engine_version=ENGINE_VERSION,
                       risk_score=float(round(risk_score, 4)),
                       metadata={
-                          "reason": "risk_in_review_band" if 0.45 <= risk_score <= 0.55 else "forced_review_rule",
+                          "reason": "risk_in_review_band" if 0.40 <= risk_score < 0.70 else "forced_review_rule",
                           "decision": decision,
                       })
 
@@ -1208,6 +1254,7 @@ def decision_page(lookup_id: int):
               d.engine_version,
               d.risk_score,
               d.decision,
+              d.decision_contract_version,
               a.applicant_name,
               a.annual_income,
               a.loan_amount,
@@ -1232,6 +1279,7 @@ def decision_page(lookup_id: int):
                   d.engine_version,
                   d.risk_score,
                   d.decision,
+                  d.decision_contract_version,
                   a.applicant_name,
                   a.annual_income,
                   a.loan_amount,
@@ -1268,6 +1316,7 @@ def decision_page(lookup_id: int):
         decision=row["decision"],
         risk_score=row["risk_score"],
         engine_version=row["engine_version"],
+        contract_version=row["decision_contract_version"] or "",
         annual_income=row["annual_income"],
         loan_amount=row["loan_amount"],
         credit_score=row["credit_score"],

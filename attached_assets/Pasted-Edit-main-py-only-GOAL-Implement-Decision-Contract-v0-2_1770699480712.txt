@@ -1,0 +1,82 @@
+Edit main.py only.
+
+GOAL:
+Implement Decision Contract v0.2 so explanations (reason codes) are conditional and not always the same for every decision.
+
+CURRENT PROBLEM:
+Top reason codes show the same three codes for every decision (counts equal total decisions). We need selective reasons based on inputs + thresholds + outcome.
+
+REQUIREMENTS:
+1) Add a constant:
+DECISION_CONTRACT_VERSION = "v0.2"
+ENGINE_VERSION = "rules-v0.2"
+
+2) Update your scoring/explanation function (whatever currently produces:
+- decision (APPROVE/REVIEW/REJECT)
+- risk_score (0-1)
+- explanations_json list of {code, text, value, impact}
+) so that reasons follow these rules:
+
+A) Compute these features:
+- credit_score (300-850)
+- dti = loan_amount / max(annual_income, 1)
+- emp_years
+
+B) Determine severity per feature:
+- CREDIT_SCORE severity:
+   - if credit_score < 580 => "high"
+   - 580-669 => "med"
+   - 670+ => "low" (do not include unless borderline)
+- DTI severity:
+   - if dti > 0.6 => "high"
+   - 0.35-0.6 => "med"
+   - <=0.35 => "low" (usually exclude)
+- EMPLOYMENT severity:
+   - if emp_years < 1 => "high"
+   - 1-2 => "med"
+   - >=2 => "low"
+
+C) Decide outcome using risk_score thresholds:
+- if risk_score >= 0.70 => REJECT
+- if 0.40 <= risk_score < 0.70 => REVIEW
+- if risk_score < 0.40 => APPROVE
+
+D) Explanation filtering policy (THIS IS THE MAIN CHANGE):
+- For REJECT: include ONLY "high" severity reasons (max 4)
+- For REVIEW: include "high" + "med" severity reasons (max 4)
+- For APPROVE: include ONLY the top 1-2 reasons IF they are at least "med" severity.
+  Otherwise explanations list should be empty or a single "LOW_RISK" reason.
+
+E) Impacts:
+Set impact weights roughly like:
+- CREDIT_SCORE: high=0.35, med=0.18, low=0.05
+- DTI: high=0.30, med=0.15, low=0.05
+- EMPLOYMENT: high=0.20, med=0.10, low=0.03
+
+Risk score should be the sum of included impacts, clipped to [0,1].
+(Or keep your existing scoring but ensure severity + filtering still applies.)
+
+3) Persistence / logging:
+Wherever you insert into the decisions table:
+- set engine_version to ENGINE_VERSION
+- also store decision_contract_version in the record (if schema has it).
+If schema does not have decision_contract_version column:
+- add it via a safe migration:
+  ALTER TABLE decisions ADD COLUMN decision_contract_version TEXT;
+  (Wrap in try/except so it doesn't crash if column exists.)
+
+4) UI:
+- On /decision/<id>, show contract version near engine_version.
+Example: “rules-v0.2 | contract v0.2”
+- Ensure /dashboard “Top Reason Codes” now shows varied distributions.
+
+5) Backwards compatibility:
+Do not break old rows that have engine_version=rules-v0.1.
+If explanations_json is empty/null, handle gracefully in templates.
+
+DELIVERABLE:
+After changes, simulate 20 applications:
+- Some APPROVE rows should have 0 or 1 reason.
+- REVIEW rows should have 2-4 reasons.
+- REJECT rows should have 1-3 strong reasons.
+- Dashboard top reason counts should no longer equal total decisions.
