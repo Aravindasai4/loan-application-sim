@@ -345,8 +345,6 @@ APPLY_HTML = """
       </div>
     </div>
 
-    <label><input type="checkbox" name="force_review" value="1"> Force human review (testing)</label>
-
     <button type="submit">Submit Application</button>
   </form>
 </body>
@@ -640,14 +638,9 @@ EVENTS_HTML = """
 # -----------------------------
 
 
-def create_application_and_decide(inp: AppInput, source: str = "manual", sim_day: str | None = None, force_review: bool = False):
+def create_application_and_decide(inp: AppInput, source: str = "manual", sim_day: str | None = None):
     risk_score, reason_details = compute_risk_and_reasons(inp)
     decision, needs_review = decide(risk_score, inp)
-
-    if force_review:
-        decision = "REVIEW"
-        needs_review = True
-        risk_score = 0.55
 
     created_at = utc_now_iso()
     raw = {
@@ -769,11 +762,7 @@ def apply_post():
         employment_years=employment_years,
     )
 
-    force_review = request.form.get("force_review") == "1"
-
-    decision, risk_score, reason_details = create_application_and_decide(
-        inp, source="manual", force_review=force_review
-    )
+    decision, risk_score, reason_details = create_application_and_decide(inp, source="manual")
 
     return render_template_string(
         RESULT_HTML,
