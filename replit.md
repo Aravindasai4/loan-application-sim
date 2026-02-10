@@ -57,6 +57,13 @@ When a reviewer approves/rejects a REVIEW case, the decisions table is updated w
 - `GET /dashboard` - Dashboard with decision metrics, reason codes, pending reviews, drift table, recent alerts
 - `GET /dbinfo` - Debug info (JSON)
 
+#### Governance JSON API (stable, for external dashboards)
+- `GET /api/contract` - Contract metadata: version, engine, thresholds, schemas, definitions
+- `GET /api/measure/summary?window=24h|7d|all` - Aggregated metrics with slips, corrections, drift snapshot
+- `GET /api/events?limit=N` - Audit events (JSON, default 500, max 2000)
+- `GET /api/decisions?limit=N` - Decisions with reasons (JSON, default 200, max 2000)
+- `GET /api/alerts?limit=N` - Alerts (JSON, default 200, max 2000)
+
 ## Database
 - Uses absolute path: `BASE_DIR/loan_sim.db`
 - Single persistent DB file across all routes and restarts
@@ -78,3 +85,4 @@ Autoscale deployment using gunicorn: `gunicorn --bind=0.0.0.0:5000 --reuse-port 
 - Feb 2026: Added /sim page for generating random and borderline synthetic applications. Added /dashboard with decision summary tables, top reason codes, and stuck review queue.
 - Feb 2026: Implemented Decision Contract v0.2 — severity-based scoring with conditional explanation filtering. New thresholds: APPROVE<0.40, REVIEW 0.40-0.70, REJECT>=0.70. Reason codes now vary by decision outcome. Added decision_contract_version column to decisions table.
 - Feb 2026: Implemented Decision Contract v0.3 — Drift & Stability monitoring. Added daily_metrics and alerts tables. compute_daily_metrics_and_alerts() aggregates per-day stats and detects drift signals (REVIEW_RATE_SPIKE, RISK_SPIKE, CREDIT_SHIFT, INCOME_SHIFT) vs 7-day trailing baseline. New routes: /metrics/daily.json, /alerts, /alerts.json. Dashboard extended with drift table and recent alerts. Alerts nav link added to all pages.
+- Feb 2026: Added stable Governance JSON API (/api/*) for external dashboard consumption. Endpoints: /api/contract (metadata, thresholds, definitions), /api/measure/summary (windowed metrics with slips, corrections, drift snapshot), /api/events, /api/decisions, /api/alerts. Reuses existing helpers where possible. Existing HTML and .json routes preserved.

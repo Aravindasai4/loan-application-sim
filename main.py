@@ -18,6 +18,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "loan_sim.db")
 DECISION_CONTRACT_VERSION = "v0.2"
 ENGINE_VERSION = "rules-v0.2"
+REVIEW_THRESHOLD = 0.40
+REJECT_THRESHOLD = 0.70
 
 
 # -----------------------------
@@ -524,9 +526,9 @@ def compute_risk_and_reasons(inp: AppInput) -> Tuple[float, List[Dict], str]:
 
     risk_score = clamp(sum(f["impact"] for f in features), 0.0, 1.0)
 
-    if risk_score >= 0.70:
+    if risk_score >= REJECT_THRESHOLD:
         decision = "REJECT"
-    elif risk_score >= 0.40:
+    elif risk_score >= REVIEW_THRESHOLD:
         decision = "REVIEW"
     else:
         decision = "APPROVE"
@@ -1234,8 +1236,8 @@ def create_application_and_decide(inp: AppInput, source: str = "manual", sim_day
                   metadata={
                       "decision": decision,
                       "reason_codes": [d["code"] for d in reason_details],
-                      "approve_threshold": 0.40,
-                      "review_threshold": 0.70,
+                      "approve_threshold": REVIEW_THRESHOLD,
+                      "review_threshold": REJECT_THRESHOLD,
                       "decision_contract_version": DECISION_CONTRACT_VERSION,
                   })
 
@@ -1823,9 +1825,6 @@ def dbinfo():
 # Governance JSON API (/api/*)
 # -----------------------------
 
-REVIEW_THRESHOLD = 0.40
-REJECT_THRESHOLD = 0.70
-
 ALL_EVENT_TYPES = [
     "APPLICATION_SUBMITTED",
     "AUTO_DECISION_MADE",
@@ -1862,7 +1861,8 @@ def _count_slips_and_corrections(conn: sqlite3.Connection, cutoff: str | None) -
         f"""
         SELECT
             ev_auto.metadata_json AS auto_meta,
-            rt.human_outcome
+            rt.human_outcome,
+            ev_auto.risk_score AS auto_risk
         FROM review_tasks rt
         JOIN decisions d ON d.id = rt.decision_id
         LEFT JOIN events ev_auto ON ev_auto.decision_id = d.id
@@ -1878,11 +1878,25 @@ def _count_slips_and_corrections(conn: sqlite3.Connection, cutoff: str | None) -
     corrections = 0
     for r in rows:
         human = r["human_outcome"]
+        auto_decision = None
+
         try:
             auto_meta = json.loads(r["auto_meta"] or "{}")
+            auto_decision = auto_meta.get("decision")
         except Exception:
-            auto_meta = {}
-        auto_decision = auto_meta.get("decision", "")
+            pass
+
+        if not auto_decision and r["auto_risk"] is not None:
+            rs = r["auto_risk"]
+            if rs >= REJECT_THRESHOLD:
+                auto_decision = "REJECT"
+            elif rs >= REVIEW_THRESHOLD:
+                auto_decision = "REVIEW"
+            else:
+                auto_decision = "APPROVE"
+
+        if not auto_decision:
+            auto_decision = "REVIEW"
 
         if auto_decision == "REVIEW":
             corrections += 1
@@ -1994,18 +2008,9 @@ def _compute_drift_snapshot(conn: sqlite3.Connection, cutoff: str | None) -> dic
     baseline = conn.execute(
         """
         SELECT
-            AVG(avg_credit) AS credit_baseline,
-            AVG(avg_income) AS income_baseline,
-            COUNT(*) AS n_days
-        FROM daily_metrics
-        WHERE day >= ? AND day <= ?
-        """,
-        (baseline_start, baseline_end),
-    ).fetchone()
-
-    baseline_dti_row = conn.execute(
-        """
-        SELECT AVG(CASE WHEN a.annual_income > 0 THEN a.loan_amount / a.annual_income ELSE 0 END) AS dti_baseline
+            AVG(a.credit_score) AS credit_baseline,
+            AVG(a.annual_income) AS income_baseline,
+            AVG(CASE WHEN a.annual_income > 0 THEN a.loan_amount / a.annual_income ELSE 0 END) AS dti_baseline
         FROM decisions d
         JOIN applications a ON a.id = d.application_id
         WHERE DATE(d.created_at) >= ? AND DATE(d.created_at) <= ?
@@ -2019,7 +2024,7 @@ def _compute_drift_snapshot(conn: sqlite3.Connection, cutoff: str | None) -> dic
 
     credit_baseline = round(baseline["credit_baseline"] or 0, 2) if baseline and baseline["credit_baseline"] else None
     income_baseline = round(baseline["income_baseline"] or 0, 2) if baseline and baseline["income_baseline"] else None
-    dti_baseline = round(baseline_dti_row["dti_baseline"] or 0, 6) if baseline_dti_row and baseline_dti_row["dti_baseline"] else None
+    dti_baseline = round(baseline["dti_baseline"] or 0, 6) if baseline and baseline["dti_baseline"] else None
 
     credit_shift = round(credit_avg - credit_baseline, 2) if credit_avg is not None and credit_baseline is not None else None
     income_shift_pct = round((income_avg - income_baseline) / income_baseline, 6) if income_avg is not None and income_baseline is not None and income_baseline > 0 else None
