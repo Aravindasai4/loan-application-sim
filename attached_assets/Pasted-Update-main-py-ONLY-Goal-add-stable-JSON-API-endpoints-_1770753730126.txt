@@ -1,0 +1,51 @@
+Update main.py ONLY.
+
+Goal: add stable JSON API endpoints for a separate governance dashboard app.
+Do not break existing HTML routes.
+
+1) Add/ensure these endpoints exist and return JSON (application/json):
+- GET /api/contract
+- GET /api/measure/summary?window=24h|7d|all
+- GET /api/events?limit=500
+- GET /api/decisions?limit=200
+- GET /api/alerts?limit=200
+
+2) If the app already has JSON routes like /events.json or /alerts.json, keep them, but make /api/* call the same underlying functions.
+
+3) /api/contract should return:
+{
+  "contract_version": "v0.3",
+  "engine_version": "<current engine string>",
+  "decision_types": ["APPROVE","REVIEW","REJECT"],
+  "event_types": [...all event type strings used...],
+  "inputs_schema": { "annual_income":"number", "loan_amount":"number", "credit_score":"int", "employment_years":"number", "applicant_name":"string?" },
+  "reason_codes": ["CREDIT_SCORE_LOW","DTI_HIGH","EMPLOYMENT_SHORT", ...],
+  "thresholds": { "review_threshold": <number>, "reject_threshold": <number> },
+  "definitions": {
+     "slip": "AUTO_APPROVE then HUMAN_REJECT, or AUTO_REJECT then HUMAN_APPROVE",
+     "correction": "AUTO_REVIEW then HUMAN_APPROVE/HUMAN_REJECT"
+  }
+}
+
+4) /api/measure/summary should compute metrics for the requested window using existing DB tables:
+Return:
+{
+ "window":"7d",
+ "total":N,
+ "approve":N,"review":N,"reject":N,
+ "review_rate":float,
+ "avg_risk":float,"max_risk":float,
+ "human_overrides":N,
+ "slips":N,
+ "corrections":N,
+ "top_reason_codes":[{"code":"DTI_HIGH","count":43}, ... up to 10],
+ "drift":{
+   "credit_avg":<num>,"credit_baseline":<num>,"credit_shift":<num>,
+   "income_avg":<num>,"income_baseline":<num>,"income_shift_pct":<num>,
+   "dti_avg":<num>,"dti_baseline":<num>,"dti_shift":<num>
+ }
+}
+
+5) Use safe defaults if there isn’t enough data (return nulls or 0s).
+6) Add minimal helper functions to avoid duplicating SQL logic.
+7) Add unit-like sanity logging in code comments only (no print spam).

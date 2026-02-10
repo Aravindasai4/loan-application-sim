@@ -1819,6 +1819,343 @@ def dbinfo():
     })
 
 
+# -----------------------------
+# Governance JSON API (/api/*)
+# -----------------------------
+
+REVIEW_THRESHOLD = 0.40
+REJECT_THRESHOLD = 0.70
+
+ALL_EVENT_TYPES = [
+    "APPLICATION_SUBMITTED",
+    "AUTO_DECISION_MADE",
+    "SENT_TO_HUMAN_REVIEW",
+    "HUMAN_APPROVED",
+    "HUMAN_REJECTED",
+]
+
+ALL_REASON_CODES = [
+    "CREDIT_SCORE_LOW",
+    "DTI_HIGH",
+    "EMPLOYMENT_SHORT",
+    "LOW_RISK",
+]
+
+
+def _window_cutoff(window: str) -> str | None:
+    now = datetime.now(timezone.utc)
+    if window == "24h":
+        return (now - timedelta(hours=24)).isoformat()
+    elif window == "7d":
+        return (now - timedelta(days=7)).isoformat()
+    return None
+
+
+def _count_slips_and_corrections(conn: sqlite3.Connection, cutoff: str | None) -> Tuple[int, int]:
+    where = ""
+    params: tuple = ()
+    if cutoff:
+        where = "AND rt.resolved_at >= ?"
+        params = (cutoff,)
+
+    rows = conn.execute(
+        f"""
+        SELECT
+            ev_auto.metadata_json AS auto_meta,
+            rt.human_outcome
+        FROM review_tasks rt
+        JOIN decisions d ON d.id = rt.decision_id
+        LEFT JOIN events ev_auto ON ev_auto.decision_id = d.id
+            AND ev_auto.event_type = 'AUTO_DECISION_MADE'
+        WHERE rt.status = 'RESOLVED'
+          AND rt.human_outcome IS NOT NULL
+          {where}
+        """,
+        params,
+    ).fetchall()
+
+    slips = 0
+    corrections = 0
+    for r in rows:
+        human = r["human_outcome"]
+        try:
+            auto_meta = json.loads(r["auto_meta"] or "{}")
+        except Exception:
+            auto_meta = {}
+        auto_decision = auto_meta.get("decision", "")
+
+        if auto_decision == "REVIEW":
+            corrections += 1
+        elif (auto_decision == "APPROVE" and human == "REJECT") or \
+             (auto_decision == "REJECT" and human == "APPROVE"):
+            slips += 1
+
+    return slips, corrections
+
+
+def _compute_summary(conn: sqlite3.Connection, window: str) -> dict:
+    cutoff = _window_cutoff(window)
+    where = "WHERE d.created_at >= ?" if cutoff else ""
+    params: tuple = (cutoff,) if cutoff else ()
+
+    row = conn.execute(
+        f"""
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN d.decision = 'APPROVE' THEN 1 ELSE 0 END) AS approve,
+          SUM(CASE WHEN d.decision = 'REVIEW' THEN 1 ELSE 0 END) AS review,
+          SUM(CASE WHEN d.decision = 'REJECT' THEN 1 ELSE 0 END) AS reject,
+          AVG(d.risk_score) AS avg_risk,
+          MAX(d.risk_score) AS max_risk
+        FROM decisions d
+        {where}
+        """,
+        params,
+    ).fetchone()
+
+    total = row["total"] or 0
+    review_count = row["review"] or 0
+    review_rate = round(review_count / total, 6) if total > 0 else 0.0
+
+    override_where = "WHERE ev.event_type IN ('HUMAN_APPROVED', 'HUMAN_REJECTED')"
+    if cutoff:
+        override_where += " AND ev.created_at >= ?"
+    override_row = conn.execute(
+        f"SELECT COUNT(*) AS c FROM events ev {override_where}",
+        params,
+    ).fetchone()
+
+    slips, corrections = _count_slips_and_corrections(conn, cutoff)
+
+    from collections import Counter
+    reason_where = "WHERE d.created_at >= ?" if cutoff else ""
+    reason_rows = conn.execute(
+        f"""
+        SELECT e.reason_details_json
+        FROM explanations e
+        JOIN decisions d ON d.id = e.decision_id
+        {reason_where}
+        """,
+        params,
+    ).fetchall()
+
+    code_counter = Counter()
+    for rr in reason_rows:
+        try:
+            details = json.loads(rr["reason_details_json"] or "[]")
+            for item in details:
+                if isinstance(item, dict) and "code" in item:
+                    code_counter[item["code"]] += 1
+        except Exception:
+            pass
+
+    top_reason_codes = [{"code": code, "count": count} for code, count in code_counter.most_common(10)]
+
+    drift = _compute_drift_snapshot(conn, cutoff)
+
+    return {
+        "window": window,
+        "total": total,
+        "approve": row["approve"] or 0,
+        "review": review_count,
+        "reject": row["reject"] or 0,
+        "review_rate": round(review_rate, 6),
+        "avg_risk": round(row["avg_risk"] or 0, 6),
+        "max_risk": round(row["max_risk"] or 0, 6),
+        "human_overrides": override_row["c"] or 0,
+        "slips": slips,
+        "corrections": corrections,
+        "top_reason_codes": top_reason_codes,
+        "drift": drift,
+    }
+
+
+def _compute_drift_snapshot(conn: sqlite3.Connection, cutoff: str | None) -> dict:
+    where = "WHERE d.created_at >= ?" if cutoff else ""
+    params: tuple = (cutoff,) if cutoff else ()
+
+    row = conn.execute(
+        f"""
+        SELECT
+            AVG(a.credit_score) AS credit_avg,
+            AVG(a.annual_income) AS income_avg,
+            AVG(CASE WHEN a.annual_income > 0 THEN a.loan_amount / a.annual_income ELSE 0 END) AS dti_avg
+        FROM decisions d
+        JOIN applications a ON a.id = d.application_id
+        {where}
+        """,
+        params,
+    ).fetchone()
+
+    now = datetime.now(timezone.utc)
+    baseline_start = (now - timedelta(days=8)).strftime("%Y-%m-%d")
+    baseline_end = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    baseline = conn.execute(
+        """
+        SELECT
+            AVG(avg_credit) AS credit_baseline,
+            AVG(avg_income) AS income_baseline,
+            COUNT(*) AS n_days
+        FROM daily_metrics
+        WHERE day >= ? AND day <= ?
+        """,
+        (baseline_start, baseline_end),
+    ).fetchone()
+
+    baseline_dti_row = conn.execute(
+        """
+        SELECT AVG(CASE WHEN a.annual_income > 0 THEN a.loan_amount / a.annual_income ELSE 0 END) AS dti_baseline
+        FROM decisions d
+        JOIN applications a ON a.id = d.application_id
+        WHERE DATE(d.created_at) >= ? AND DATE(d.created_at) <= ?
+        """,
+        (baseline_start, baseline_end),
+    ).fetchone()
+
+    credit_avg = round(row["credit_avg"] or 0, 2) if row["credit_avg"] else None
+    income_avg = round(row["income_avg"] or 0, 2) if row["income_avg"] else None
+    dti_avg = round(row["dti_avg"] or 0, 6) if row["dti_avg"] else None
+
+    credit_baseline = round(baseline["credit_baseline"] or 0, 2) if baseline and baseline["credit_baseline"] else None
+    income_baseline = round(baseline["income_baseline"] or 0, 2) if baseline and baseline["income_baseline"] else None
+    dti_baseline = round(baseline_dti_row["dti_baseline"] or 0, 6) if baseline_dti_row and baseline_dti_row["dti_baseline"] else None
+
+    credit_shift = round(credit_avg - credit_baseline, 2) if credit_avg is not None and credit_baseline is not None else None
+    income_shift_pct = round((income_avg - income_baseline) / income_baseline, 6) if income_avg is not None and income_baseline is not None and income_baseline > 0 else None
+    dti_shift = round(dti_avg - dti_baseline, 6) if dti_avg is not None and dti_baseline is not None else None
+
+    return {
+        "credit_avg": credit_avg,
+        "credit_baseline": credit_baseline,
+        "credit_shift": credit_shift,
+        "income_avg": income_avg,
+        "income_baseline": income_baseline,
+        "income_shift_pct": income_shift_pct,
+        "dti_avg": dti_avg,
+        "dti_baseline": dti_baseline,
+        "dti_shift": dti_shift,
+    }
+
+
+def _fetch_decisions(limit: int = 200):
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                d.id AS decision_id,
+                d.application_id,
+                d.created_at,
+                d.engine_version,
+                d.risk_score,
+                d.decision,
+                d.decision_contract_version,
+                a.applicant_name,
+                a.annual_income,
+                a.loan_amount,
+                a.credit_score,
+                a.employment_years,
+                a.source,
+                e.reasons_json,
+                e.reason_details_json
+            FROM decisions d
+            JOIN applications a ON a.id = d.application_id
+            LEFT JOIN explanations e ON e.decision_id = d.id
+            ORDER BY d.created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    result = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["reasons"] = json.loads(d.pop("reasons_json", "[]") or "[]")
+        except Exception:
+            d["reasons"] = []
+        try:
+            d["reason_details"] = json.loads(d.pop("reason_details_json", "[]") or "[]")
+        except Exception:
+            d["reason_details"] = []
+        result.append(d)
+    return result
+
+
+def _fetch_alerts(limit: int = 200):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM alerts ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["details"] = json.loads(d.pop("details_json", "{}") or "{}")
+        except Exception:
+            d["details"] = {}
+        result.append(d)
+    return result
+
+
+@APP.get("/api/contract")
+def api_contract():
+    return jsonify({
+        "contract_version": DECISION_CONTRACT_VERSION,
+        "engine_version": ENGINE_VERSION,
+        "decision_types": ["APPROVE", "REVIEW", "REJECT"],
+        "event_types": ALL_EVENT_TYPES,
+        "inputs_schema": {
+            "annual_income": "number",
+            "loan_amount": "number",
+            "credit_score": "int",
+            "employment_years": "number",
+            "applicant_name": "string?",
+        },
+        "reason_codes": ALL_REASON_CODES,
+        "thresholds": {
+            "review_threshold": REVIEW_THRESHOLD,
+            "reject_threshold": REJECT_THRESHOLD,
+        },
+        "definitions": {
+            "slip": "AUTO_APPROVE then HUMAN_REJECT, or AUTO_REJECT then HUMAN_APPROVE",
+            "correction": "AUTO_REVIEW then HUMAN_APPROVE/HUMAN_REJECT",
+        },
+    })
+
+
+@APP.get("/api/measure/summary")
+def api_measure_summary():
+    window = request.args.get("window", "7d")
+    if window not in ("24h", "7d", "all"):
+        window = "7d"
+    with db() as conn:
+        result = _compute_summary(conn, window)
+    return jsonify(result)
+
+
+@APP.get("/api/events")
+def api_events():
+    limit = min(int(request.args.get("limit", 500)), 2000)
+    events = _fetch_events(limit)
+    return jsonify(events)
+
+
+@APP.get("/api/decisions")
+def api_decisions():
+    limit = min(int(request.args.get("limit", 200)), 2000)
+    decisions = _fetch_decisions(limit)
+    return jsonify(decisions)
+
+
+@APP.get("/api/alerts")
+def api_alerts():
+    limit = min(int(request.args.get("limit", 200)), 2000)
+    alerts = _fetch_alerts(limit)
+    return jsonify(alerts)
+
+
 init_db()
 migrate_db()
 
